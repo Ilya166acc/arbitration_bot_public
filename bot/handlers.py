@@ -14,6 +14,9 @@ from database.db import (
 from core.loader import load_clients_from_csv
 from core.checker import check_all_clients
 
+# Глобальная блокировка для проверок
+_check_lock = asyncio.Lock()
+
 router = Router()
 MAX_MESSAGE_LENGTH = 3800
 
@@ -189,10 +192,15 @@ async def cmd_del(message: Message):
 @router.message(Command("check"))
 async def cmd_check(message: Message):
     user_id = message.from_user.id
-    await message.answer("🔍 Запускаю проверку. Это может занять несколько минут...")
-    
-    try:
-        results, errors = await asyncio.to_thread(check_all_clients, user_id)
+
+    if _check_lock.locked():
+        await message.answer("⏳ Проверка уже выполняется. Пожалуйста, подождите.")
+        return
+
+    async with _check_lock:
+        await message.answer("🔍 Запускаю проверку. Это может занять несколько минут...")
+        try:
+            results, errors = await asyncio.to_thread(check_all_clients, user_id)
     except Exception as e:
         await message.answer(f"❌ Критическая ошибка при запуске: {e}")
         return
