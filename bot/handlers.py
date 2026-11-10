@@ -193,43 +193,48 @@ async def cmd_del(message: Message):
 async def cmd_check(message: Message):
     user_id = message.from_user.id
 
+    # Проверка блокировки (если уже идет проверка)
     if _check_lock.locked():
         await message.answer("⏳ Проверка уже выполняется. Пожалуйста, подождите.")
         return
 
+    # Захватываем блокировку и запускаем проверку
     async with _check_lock:
         await message.answer("🔍 Запускаю проверку. Это может занять несколько минут...")
+        
         try:
             results, errors = await asyncio.to_thread(check_all_clients, user_id)
-    except Exception as e:
-        await message.answer(f"❌ Критическая ошибка при запуске: {e}")
-        return
+        except Exception as e:
+            await message.answer(f"❌ Критическая ошибка при запуске: {e}")
+            return
 
-    if errors:
-        error_text = "⚠️ *Во время проверки возникли ошибки:*\n" + "\n".join(errors)
-        await message.answer(error_text, parse_mode="Markdown")
+        # Если во время проверки были ошибки, выводим их
+        if errors:
+            error_text = "⚠️ *Во время проверки возникли ошибки:*\n" + "\n".join(errors)
+            await message.answer(error_text, parse_mode="Markdown")
 
-    if not results:
-        if not errors:
-            await message.answer("✅ Проверка завершена. Новых дел не найдено.")
-        return
+        if not results:
+            if not errors:
+                await message.answer("✅ Проверка завершена. Новых дел не найдено.")
+            return
 
-    total_new = sum(len(cases) for cases in results.values())
-    text = f"🔔 *Новые дела за проверку* (всего: {total_new})\n\n"
+        # Формируем отчет
+        total_new = sum(len(cases) for cases in results.values())
+        text = f"🔔 *Новые дела за проверку* (всего: {total_new})\n\n"
 
-    for client_name, cases in results.items():
-        text += f"👤 *{client_name}*\n"
-        for case in cases:
-            text += (
-                f"  • Дело № {case['case_number']}\n"
-                f"    Суд: {case['court']}\n"
-                f"    Истец: {case['plaintiff']}\n"
-                f"    Ответчик: {case['defendant']}\n"
-                f"    Поступило: {case['receipt_date']}\n"
-                f"    🔗 {case['url']}\n\n"
-            )
+        for client_name, cases in results.items():
+            text += f"👤 *{client_name}*\n"
+            for case in cases:
+                text += (
+                    f"  • Дело № {case['case_number']}\n"
+                    f"    Суд: {case['court']}\n"
+                    f"    Истец: {case['plaintiff']}\n"
+                    f"    Ответчик: {case['defendant']}\n"
+                    f"    Поступило: {case['receipt_date']}\n"
+                    f"    🔗 {case['url']}\n\n"
+                )
 
-    await send_long_message(message, text)
+        await send_long_message(message, text)
 
 
 @router.message(Command("report"))
