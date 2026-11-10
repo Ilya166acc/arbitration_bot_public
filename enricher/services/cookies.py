@@ -38,6 +38,27 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
             except Exception as e:
                 print(f"DEBUG: Ошибка загрузки страницы: {e}")
 
+            # === НОВЫЙ БЛОК: Имитация активности человека ===
+            print("DEBUG: Имитирую активность пользователя...")
+            try:
+                # Двигаем мышь и кликаем по пустому месту
+                page.mouse.move(500, 300)
+                page.mouse.click(500, 300)
+                page.wait_for_timeout(1000)
+                
+                # Скроллим страницу вниз
+                page.mouse.wheel(0, 500)
+                page.wait_for_timeout(1000)
+                
+                # Пробуем найти кнопку "Найти" (если она есть на странице)
+                find_btn = page.locator('button[type="submit"]', has_text="Найти")
+                if find_btn.first.is_visible(timeout=3000):
+                    find_btn.first.click()
+                    page.wait_for_timeout(8000) # Ждем 8 секунд после клика
+            except Exception as e:
+                print(f"DEBUG: Ошибка при имитации кликов: {e}")
+            # ====================================================
+
             print("DEBUG: Собираю куки...")
             cookie_list = context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookie_list}

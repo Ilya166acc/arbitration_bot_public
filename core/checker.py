@@ -27,6 +27,13 @@ def check_all_clients(user_id: int) -> tuple[Dict[str, List[Dict]], List[str]]:
         except Exception as e:
             logger.error(f"Ошибка при проверке {inn}: {e}")
             errors.append(f"Ошибка по клиенту {name} (ИНН {inn}): {e}")
+            
+            # Если это ошибка куки, прерываем проверку остальных клиентов
+            if "HTTP 451" in str(e) or "CookieExpiredError" in str(e):
+                logger.error("❌ Куки не удалось обновить. Прерываем проверку всех клиентов.")
+                errors.append("⚠️ Проверка прервана: не удалось обновить куки (сайт блокирует сервер).")
+                break 
+                
             continue
 
         new_cases = []
