@@ -6,12 +6,29 @@ import subprocess
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from typing import Callable, Dict, Any, Awaitable
+from config import BOT_TOKEN, LOG_LEVEL, ALLOWED_USER_IDS  
 
 from config import BOT_TOKEN, LOG_LEVEL
 from bot.handlers import router
 from database.models import create_tables  # <-- ИМПОРТ ДЛЯ БАЗЫ ДАННЫХ
 
-
+# Класс для проверки доступа
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user_id = data['event_from_user'].id
+        # Если список пуст — пускаем всех (для локальной разработки)
+        if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Попытка доступа от неавторизованного пользователя: {user_id}")
+            return # Игнорируем сообщение
+        return await handler(event, data)
 # Настраиваем логирование
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -59,6 +76,9 @@ async def main():
     
     # Создаём диспетчер
     dp = Dispatcher()
+    
+    # Включаем защиту
+    dp.message.outer_middleware(AccessMiddleware())
     
     # Подключаем роутер с командами
     dp.include_router(router)

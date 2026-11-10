@@ -7,6 +7,8 @@ load_dotenv()
 # === Секреты ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+# Список ID пользователей, которым разрешен доступ
+ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 
 # === Пути к файлам ===
 CLIENTS_CSV = "data/clients.csv"
