@@ -1,0 +1,11 @@
+.env
+venv/
+.git/
+.gitignore
+data/bot.db
+cookies.json
+results.json
+debug_response.html
+__pycache__/
+*.pyc
+*.log
