@@ -159,8 +159,9 @@ def build_cases_request(page: int, count: int, courts: list[str] | None = None,
 
 def get_cases(cookies_file: str, page: int = 1, count: int = 25,
               courts: list[str] | None = None, sides: list[str] | None = None,
-              date_from: str | None = None, date_to: str | None = None):
-    """Возвращает дела + контекст запроса."""
+              date_from: str | None = None, date_to: str | None = None,
+              *, include_html: bool = False):
+    """Возвращает дела и контекст; include_html добавляет исходный HTML в конец."""
     if not os.path.exists(cookies_file):
         raise FileNotFoundError(f"Файл кук не найден: {cookies_file}")
     logger.info(f"Loading cookies from {cookies_file}")
@@ -173,7 +174,8 @@ def get_cases(cookies_file: str, page: int = 1, count: int = 25,
     rows = parse_cases(html)
     pages_count = parse_pages_count(html)
     logger.info(f"Pages count detected: {pages_count}")
-    return rows, cookies_dict, headers, proxies, pages_count
+    result = (rows, cookies_dict, headers, proxies, pages_count)
+    return (*result, html) if include_html else result
 
 
 def run_cases(cookies_file: str, out_file: str, page: int = 1, count: int = 25,

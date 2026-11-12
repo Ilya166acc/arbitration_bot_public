@@ -1,5 +1,9 @@
 from playwright.sync_api import sync_playwright
 import json
+import os
+from threading import Lock
+
+_cookie_write_lock = Lock()
 
 
 def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
@@ -76,8 +80,15 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
 
 
 def save_cookies(file_path: str, data: dict) -> None:
-	with open(file_path, 'w', encoding='utf-8') as f:
-		json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp_path = os.fspath(file_path) + ".tmp"
+    with _cookie_write_lock:
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, file_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 
 def load_cookies(file_path: str) -> dict:

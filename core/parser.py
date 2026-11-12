@@ -7,6 +7,8 @@ import os
 import logging
 import platform
 import time
+import random
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -47,28 +49,26 @@ def refresh_cookies() -> None:
 
 
 def fetch_cases_by_inn(inn: str, days_back: int = 30, cookies_file: str = COOKIES_FILE) -> list:
-    date_to = datetime.now().strftime("%d.%m.%Y")
-    date_from = (datetime.now() - timedelta(days=days_back)).strftime("%d.%m.%Y")
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
+    date_to = now.strftime("%d.%m.%Y")
+    date_from = (now - timedelta(days=days_back)).strftime("%d.%m.%Y")
     logger.info(f"🔍 Ищем дела по ИНН {inn} с {date_from} по {date_to}")
 
     def _fetch_all_pages() -> list:
         all_cases = []
         page = 1
         while True:
-            rows, _, _, _, pages_count = get_cases(
+            rows, _, _, _, pages_count, html = get_cases(
                 cookies_file=cookies_file, page=page, count=25,
                 courts=None, sides=[inn],
-                date_from=date_from, date_to=date_to
+                date_from=date_from, date_to=date_to, include_html=True
             )
-            # ПРОВЕРКА НА ЗАГЛУШКУ: если 0 дел и нет маркера "num_case" в HTML
-            if not rows:
-                # Получаем HTML для проверки (нужно немного изменить get_cases, 
-                # чтобы он возвращал html, или сделать отдельный запрос)
-                # Простой вариант: если get_cases вернул 0, проверяем страницу
-                pass 
+            if not rows and "num_case" not in html and "Дела не найдены" not in html:
+                raise CookieExpiredError("Вместо результатов поиска получена пустая страница или проверка DDoS-Guard")
             all_cases.extend(rows)
             if page >= pages_count:
                 break
+            time.sleep(random.uniform(2.0, 4.0))
             page += 1
         return all_cases
 

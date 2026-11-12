@@ -1,8 +1,10 @@
 import logging
+import random
+import time
 from typing import List, Dict
 
 from database.db import get_all_clients, case_exists, add_case
-from core.parser import fetch_cases_by_inn
+from core.parser import fetch_cases_by_inn, CookieExpiredError
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +18,9 @@ def check_all_clients(user_id: int) -> tuple[Dict[str, List[Dict]], List[str]]:
     result = {}
     errors = []
 
-    for client in clients:
+    for index, client in enumerate(clients):
+        if index:
+            time.sleep(random.uniform(2.0, 4.0))
         inn = client["inn"]
         name = client["name"]
         days_back = client.get("days_back", 30)
@@ -29,7 +33,7 @@ def check_all_clients(user_id: int) -> tuple[Dict[str, List[Dict]], List[str]]:
             errors.append(f"Ошибка по клиенту {name} (ИНН {inn}): {e}")
             
             # Если это ошибка куки, прерываем проверку остальных клиентов
-            if "HTTP 451" in str(e) or "CookieExpiredError" in str(e):
+            if isinstance(e, CookieExpiredError) or "HTTP 451" in str(e):
                 logger.error("❌ Куки не удалось обновить. Прерываем проверку всех клиентов.")
                 errors.append("⚠️ Проверка прервана: не удалось обновить куки (сайт блокирует сервер).")
                 break 
@@ -50,11 +54,11 @@ def check_all_clients(user_id: int) -> tuple[Dict[str, List[Dict]], List[str]]:
             case_data = {
                 "case_number": case_number,
                 "client_inn": inn,
-                "court": case.get("court"),
-                "plaintiff": ", ".join(case.get("plaintiffs", [])),
-                "defendant": ", ".join(case.get("respondents", [])),
+                "court": case.get("court") or "—",
+                "plaintiff": ", ".join(case.get("plaintiffs") or []),
+                "defendant": ", ".join(case.get("respondents") or []),
                 "claim_amount": None,
-                "receipt_date": case.get("date"),
+                "receipt_date": case.get("date") or "—",
                 "url": case.get("caseUrl"),
                 "ai_summary": None,
             }
