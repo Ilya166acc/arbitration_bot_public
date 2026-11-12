@@ -8,7 +8,8 @@ from config import DATABASE_PATH
 
 
 def _connect():
-    return sqlite3.connect(DATABASE_PATH)
+    # timeout: не ждать блокировку файла дольше 30 секунд
+    return sqlite3.connect(DATABASE_PATH, timeout=30)
 
 
 # ============ РАБОТА С КЛИЕНТАМИ ============

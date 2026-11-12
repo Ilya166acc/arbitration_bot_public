@@ -167,7 +167,11 @@ def ensure_playwright_browser():
             if not os.path.exists(browser_path):
                 logger.info("⏳ Обнаружено обновление Playwright или отсутствие Chromium.")
                 logger.info("Скачиваю браузер (это займет 1-2 минуты)...")
-                subprocess.run(["playwright", "install", "chromium"], check=True)
+                subprocess.run(
+                    ["playwright", "install", "chromium"],
+                    check=True,
+                    timeout=900,  # установка не должна вешать запуск бота
+                )
                 logger.info("✅ Chromium успешно установлен!")
     except Exception as e:
         logger.warning(f"⚠️ Предупреждение при проверке Playwright: {e}")

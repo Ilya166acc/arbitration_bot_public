@@ -1,43 +1,88 @@
+import json
+import logging
+import os
+
 import requests
 from bs4 import BeautifulSoup
-import json
-import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 from services.cookies import load_cookies
-import logging
-import sys
+
+# === Сетевые тайм-ауты (секунды) ===
+# connect/read разделены: «сайт не отвечает» и «сайт долго думает» —
+# разные проблемы, и ждать по 60 секунд на каждую нельзя.
+CONNECT_TIMEOUT = float(os.getenv("KAD_CONNECT_TIMEOUT", "10"))
+READ_TIMEOUT = float(os.getenv("KAD_READ_TIMEOUT", "45"))
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
+
+# Повторы только для идемпотентного поиска: сетевые сбои, 429 и 5xx.
+MAX_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 1.0
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+
 
 class CookieExpiredError(Exception):
     """Куки протухли — нужно обновить через Playwright."""
     pass
+
+
 logger = logging.getLogger(__name__)
 
 
-def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict, proxies: dict | None) -> str:
-    logger.info(f"Requesting cases: url={url} page={payload.get('Page')} count={payload.get('Count')}")
+def build_session() -> requests.Session:
+    """Сессия с повторами и пулом соединений для запросов к kad.arbitr.ru."""
+    session = requests.Session()
+    retry = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        status=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUSES,
+        allowed_methods=frozenset({"GET", "POST", "HEAD"}),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=8)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-    # === ПРЕОБРАЗУЕМ PAYLOAD В FORM-DATA ===
-    form_data = {}
-    for key, value in payload.items():
-        if key == "Sides":
-            # Превращаем список объектов в JSON-строку
-            form_data[key] = json.dumps(value, ensure_ascii=False)
-        elif value is not None:
-            # Остальные поля оставляем как есть (или превращаем в строку)
-            form_data[key] = str(value)
-        else:
-            # None заменяем на пустую строку, если это нужно
-            form_data[key] = ''
-    # =====================================
+
+# Общая сессия: повторы и пул соединений для всех запросов к сайту суда.
+session = build_session()
+
+
+def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
+                     proxies: dict | None, timeout: float | tuple[float, float] | None = None) -> str:
+    """Запрашивает страницу поиска дел.
+
+    Всегда с тайм-аутом (по умолчанию CONNECT_TIMEOUT/READ_TIMEOUT) и с
+    автоматическими повторами для сетевых ошибок и 429/5xx.
+    """
+    logger.info(f"Requesting cases: url={url} page={payload.get('Page')} count={payload.get('Count')}")
+    timeout = timeout or DEFAULT_TIMEOUT
 
     try:
-        # Отправляем form_data, а не payload
-        resp = requests.post(url, cookies=cookies, headers=headers, json=payload, proxies=proxies, timeout=60)
+        resp = session.post(
+            url, cookies=cookies, headers=headers, json=payload,
+            proxies=proxies, timeout=timeout,
+        )
         resp.raise_for_status()
     except requests.HTTPError as e:
         status = getattr(getattr(e, 'response', None), 'status_code', None)
         if status == 451:
             raise CookieExpiredError("Куки протухли (HTTP 451)")
+        logger.error("KAD ответил ошибкой статуса %s", status)
         raise
+    except requests.Timeout as e:
+        logger.error("Тайм-аут запроса к KAD (%s с): %s", timeout, e)
+        raise
+    except requests.RequestException as e:
+        logger.error("Сетевая ошибка при запросе к KAD: %s", e)
+        raise
+
     logger.info(f"Cases response ok: status={resp.status_code} bytes={len(resp.text)}")
     return resp.text
 
@@ -46,16 +91,12 @@ def parse_cases(html: str) -> list:
 
     soup = BeautifulSoup(html, 'html.parser')
     rows = []
-    seen_tr = set()
+    seen_cases = set()
 
     for case_a in soup.find_all('a', class_='num_case'):
         tr = case_a.find_parent('tr')
         if tr is None:
             continue
-        key = id(tr)
-        if key in seen_tr:
-            continue
-        seen_tr.add(key)
 
         num_td = tr.find('td', class_='num')
         court_td = tr.find('td', class_='court')
@@ -66,6 +107,13 @@ def parse_cases(html: str) -> list:
         date_text = date_span.get_text(strip=True) if date_span else None
         case_number = case_a.get_text(strip=True)
         case_url = case_a.get('href', '').strip()
+
+        # Одно дело может быть отрисовано несколькими ссылками —
+        # дубликаты отбрасываем по номеру дела.
+        key = (case_number, case_url)
+        if key in seen_cases:
+            continue
+        seen_cases.add(key)
 
         judge_div = court_td.find('div', class_='judge') if court_td else None
         judge = judge_div.get_text(strip=True) if judge_div else None
@@ -159,8 +207,9 @@ def build_cases_request(page: int, count: int, courts: list[str] | None = None,
 
 def get_cases(cookies_file: str, page: int = 1, count: int = 25,
               courts: list[str] | None = None, sides: list[str] | None = None,
-              date_from: str | None = None, date_to: str | None = None):
-    """Возвращает дела + контекст запроса."""
+              date_from: str | None = None, date_to: str | None = None,
+              *, include_html: bool = False):
+    """Возвращает дела и контекст; include_html добавляет исходный HTML в конец."""
     if not os.path.exists(cookies_file):
         raise FileNotFoundError(f"Файл кук не найден: {cookies_file}")
     logger.info(f"Loading cookies from {cookies_file}")
@@ -173,7 +222,8 @@ def get_cases(cookies_file: str, page: int = 1, count: int = 25,
     rows = parse_cases(html)
     pages_count = parse_pages_count(html)
     logger.info(f"Pages count detected: {pages_count}")
-    return rows, cookies_dict, headers, proxies, pages_count
+    result = (rows, cookies_dict, headers, proxies, pages_count)
+    return (*result, html) if include_html else result
 
 
 def run_cases(cookies_file: str, out_file: str, page: int = 1, count: int = 25,

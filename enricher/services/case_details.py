@@ -1,18 +1,24 @@
+import hashlib
+import io
+import re
+import sys
+
 import requests
 from bs4 import BeautifulSoup
-import io
-import requests
-import re
-import hashlib
-import sys
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
 from playwright.sync_api import sync_playwright
 
+from services.cases import DEFAULT_TIMEOUT, session
+from services.cookies import BROWSER_LAUNCH_TIMEOUT_MS, PAGE_TIMEOUT_MS
 
-def fetch_case_html(case_url: str, cookies: dict, headers: dict, proxies: dict, timeout: int = 60) -> str:
+
+def fetch_case_html(case_url: str, cookies: dict, headers: dict, proxies: dict,
+                    timeout: float | tuple[float, float] | None = None) -> str:
+    """Скачивает страницу дела с тайм-аутом и повторами (см. services.cases)."""
+    timeout = timeout or DEFAULT_TIMEOUT
     try:
-        resp = requests.get(case_url, cookies=cookies, headers=headers, proxies=proxies, timeout=timeout)
+        resp = session.get(case_url, cookies=cookies, headers=headers, proxies=proxies, timeout=timeout)
         resp.raise_for_status()
     except requests.HTTPError as e:
         status = getattr(getattr(e, 'response', None), 'status_code', None)
@@ -150,127 +156,147 @@ def _parse_proxy_for_playwright(proxies: dict | None) -> dict | None:
 
 
 def _fetch_pdf_via_playwright(url: str, proxies: dict | None, cookies: dict | None) -> bytes | None:
+    """Достаёт PDF через браузер.
+
+    Все операции ограничены PAGE_TIMEOUT_MS, а браузер и контекст
+    закрываются в finally: раньше при любом исключении процесс Chromium
+    оставался в памяти (утечка) и мог зависнуть навсегда.
+    """
     proxy_cfg = _parse_proxy_for_playwright(proxies)
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, proxy=proxy_cfg)
-        context = browser.new_context()
-        # Прокидываем куки из cookies.json в контекст браузера
+        browser = p.chromium.launch(
+            headless=False, proxy=proxy_cfg, timeout=BROWSER_LAUNCH_TIMEOUT_MS
+        )
+        context = None
         try:
-            if cookies:
-                context.add_cookies([
-                    {
-                        'name': k,
-                        'value': v,
-                        'domain': 'kad.arbitr.ru',
-                        'path': '/',
-                    }
-                    for k, v in cookies.items()
-                ])
-        except Exception as e:
-            print(f"[pdf] add_cookies error: {e}")
-        # Патчим createObjectURL, чтобы поймать blob PDF, который viewer создаёт для <embed>
-        try:
-            context.add_init_script("""
-                (() => {
-                  const orig = URL.createObjectURL;
-                  window.__pdfCapturedBlobs = [];
-                  URL.createObjectURL = function(obj) {
-                    try {
-                      if (obj && obj.type && String(obj.type).toLowerCase().includes('pdf')) {
-                        window.__pdfCapturedBlobs.push(obj);
-                      }
-                    } catch(e) {}
-                    return orig.apply(this, arguments);
-                  };
-                })();
-            """)
-        except Exception:
-            pass
-
-        page = context.new_page()
-
-        # 1) Слушаем сетевые ответы и забираем application/pdf напрямую
-        captured_pdf_bytes: list[bytes] = []
-
-        def _on_response(resp):
+            context = browser.new_context()
+            context.set_default_timeout(PAGE_TIMEOUT_MS)
+            # Прокидываем куки из cookies.json в контекст браузера
             try:
-                ct = (resp.headers.get('content-type') or '').lower()
-                url_l = resp.url.lower()
-                if 'application/pdf' in ct or url_l.endswith('.pdf'):
-                    body = resp.body()
-                    if body:
-                        captured_pdf_bytes.append(body)
+                if cookies:
+                    context.add_cookies([
+                        {
+                            'name': k,
+                            'value': v,
+                            'domain': 'kad.arbitr.ru',
+                            'path': '/',
+                        }
+                        for k, v in cookies.items()
+                    ])
+            except Exception as e:
+                print(f"[pdf] add_cookies error: {e}")
+            # Патчим createObjectURL, чтобы поймать blob PDF, который viewer создаёт для <embed>
+            try:
+                context.add_init_script("""
+                    (() => {
+                      const orig = URL.createObjectURL;
+                      window.__pdfCapturedBlobs = [];
+                      URL.createObjectURL = function(obj) {
+                        try {
+                          if (obj && obj.type && String(obj.type).toLowerCase().includes('pdf')) {
+                            window.__pdfCapturedBlobs.push(obj);
+                          }
+                        } catch(e) {}
+                        return orig.apply(this, arguments);
+                      };
+                    })();
+                """)
             except Exception:
                 pass
 
-        context.on('response', _on_response)
-        page.on('response', _on_response)
+            page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT_MS)
 
-        # Открываем и ждём, чтобы прошли редиректы и инициализировался PDF viewer
-        page.goto(url, wait_until='load', timeout=30000)
-        page.wait_for_load_state('networkidle')
-        page.wait_for_timeout(2000)
+            # 1) Слушаем сетевые ответы и забираем application/pdf напрямую
+            captured_pdf_bytes: list[bytes] = []
 
-        # Если поймали PDF по сети — используем его
-        if captured_pdf_bytes:
-            pdf_bytes = captured_pdf_bytes[0]
+            def _on_response(resp):
+                try:
+                    ct = (resp.headers.get('content-type') or '').lower()
+                    url_l = resp.url.lower()
+                    if 'application/pdf' in ct or url_l.endswith('.pdf'):
+                        body = resp.body()
+                        if body:
+                            captured_pdf_bytes.append(body)
+                except Exception:
+                    pass
+
+            context.on('response', _on_response)
+            page.on('response', _on_response)
+
+            # Открываем и ждём, чтобы прошли редиректы и инициализировался PDF viewer
+            page.goto(url, wait_until='load', timeout=PAGE_TIMEOUT_MS)
             try:
-                with open('downloaded_result_playwright.pdf', 'wb') as f:
-                    f.write(pdf_bytes)
-            except Exception:
-                pass
-            browser.close()
-            return pdf_bytes
+                page.wait_for_load_state('networkidle', timeout=PAGE_TIMEOUT_MS)
+            except Exception as e:
+                print(f"[pdf] networkidle wait skipped: {e}")
+            page.wait_for_timeout(2000)
 
-        # 2) Фолбэк: вытащить PDF-blob из viewer (через ранее заинжекченный хук)
-        try:
-            b64 = page.evaluate("""
-                async () => {
-                  try {
-                    const blobs = window.__pdfCapturedBlobs || [];
-                    if (!blobs.length) return null;
-                    const blob = blobs[0];
-                    const buf = await blob.arrayBuffer();
-                    let binary = '';
-                    const bytes = new Uint8Array(buf);
-                    const chunkSize = 0x8000;
-                    for (let i = 0; i < bytes.length; i += chunkSize) {
-                      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-                    }
-                    return btoa(binary);
-                  } catch (e) {
-                    return null;
-                  }
-                }
-            """)
-            if b64:
-                import base64
-                pdf_bytes = base64.b64decode(b64)
+            # Если поймали PDF по сети — используем его
+            if captured_pdf_bytes:
+                pdf_bytes = captured_pdf_bytes[0]
                 try:
                     with open('downloaded_result_playwright.pdf', 'wb') as f:
                         f.write(pdf_bytes)
                 except Exception:
                     pass
-                browser.close()
                 return pdf_bytes
-        except Exception:
-            pass
 
-        # 3) Последний фолбэк: печать страницы в PDF (может не совпадать с исходным PDF)
-        pdf_bytes = page.pdf(print_background=True, prefer_css_page_size=True)
-        print(f"[pdf] page.pdf bytes={len(pdf_bytes) if pdf_bytes else 0}")
-        try:
-            with open('downloaded_page_print.pdf', 'wb') as f:
-                f.write(pdf_bytes or b'')
-        except Exception as se:
-            print(f"[pdf] save error: {se}")
-        browser.close()
-        return pdf_bytes or None
+            # 2) Фолбэк: вытащить PDF-blob из viewer (через ранее заинжекченный хук)
+            try:
+                b64 = page.evaluate("""
+                    async () => {
+                      try {
+                        const blobs = window.__pdfCapturedBlobs || [];
+                        if (!blobs.length) return null;
+                        const blob = blobs[0];
+                        const buf = await blob.arrayBuffer();
+                        let binary = '';
+                        const bytes = new Uint8Array(buf);
+                        const chunkSize = 0x8000;
+                        for (let i = 0; i < bytes.length; i += chunkSize) {
+                          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+                        }
+                        return btoa(binary);
+                      } catch (e) {
+                        return null;
+                      }
+                    }
+                """)
+                if b64:
+                    import base64
+                    pdf_bytes = base64.b64decode(b64)
+                    try:
+                        with open('downloaded_result_playwright.pdf', 'wb') as f:
+                            f.write(pdf_bytes)
+                    except Exception:
+                        pass
+                    return pdf_bytes
+            except Exception:
+                pass
+
+            # 3) Последний фолбэк: печать страницы в PDF (может не совпадать с исходным PDF)
+            pdf_bytes = page.pdf(print_background=True, prefer_css_page_size=True)
+            print(f"[pdf] page.pdf bytes={len(pdf_bytes) if pdf_bytes else 0}")
+            try:
+                with open('downloaded_page_print.pdf', 'wb') as f:
+                    f.write(pdf_bytes or b'')
+            except Exception as se:
+                print(f"[pdf] save error: {se}")
+            return pdf_bytes or None
+        finally:
+            for resource, name in ((context, "контекст"), (browser, "браузер")):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except Exception as e:
+                    print(f"[pdf] не удалось закрыть {name}: {e}")
 
 
 def _fetch_pdf_via_antibot(url: str, cookies: dict | None, headers: dict | None, proxies: dict | None, timeout: int) -> bytes | None:
     # Если сразу отдают PDF — просто вернуть
-    resp0 = requests.get(url, cookies=cookies, headers=headers, proxies=proxies or {}, timeout=timeout, allow_redirects=True)
+    resp0 = session.get(url, cookies=cookies, headers=headers, proxies=proxies or {}, timeout=timeout, allow_redirects=True)
     # print(resp0.text)
     ct0 = (resp0.headers.get('Content-Type') or '').lower()
     if 'application/pdf' in ct0 and resp0.ok:
@@ -296,7 +322,7 @@ def _fetch_pdf_via_antibot(url: str, cookies: dict | None, headers: dict | None,
     }
 
     data = {'token': token, 'hash': hash_value}
-    resp = requests.post(url, data=data, cookies=cookies, headers=post_headers, proxies=proxies or {}, timeout=timeout, allow_redirects=True)
+    resp = session.post(url, data=data, cookies=cookies, headers=post_headers, proxies=proxies or {}, timeout=timeout, allow_redirects=True)
     ct = (resp.headers.get('Content-Type') or '').lower()
     if 'application/pdf' in ct and resp.ok:
         return resp.content
