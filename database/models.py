@@ -8,7 +8,7 @@ def create_tables():
     # Создаем папку data, если её нет
     os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
 
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30)
     cursor = conn.cursor()
 
     # === Таблица клиентов ===
