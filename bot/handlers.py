@@ -1,4 +1,7 @@
 import asyncio
+import logging
+import os
+import threading
 from html import escape
 
 from aiogram.filters.command import CommandObject
@@ -17,8 +20,34 @@ from database.db import (
 from core.loader import load_clients_from_csv
 from core.checker import check_all_clients
 
-# Глобальная блокировка для проверок
+logger = logging.getLogger(__name__)
+
+# Максимальное время на одну проверку. asyncio.wait_for не умеет убивать
+# поток с Playwright, но он гарантирует, что бот перестанет ждать и
+# ответит пользователю, а не зависнет на часы.
+CHECK_TIMEOUT_SECONDS = int(os.getenv("CHECK_TIMEOUT_SECONDS", "300"))
+
+# Глобальная блокировка для проверок (защищает от параллельных запусков).
 _check_lock = asyncio.Lock()
+
+# Дополнительный флаг занятости. Нужен потому, что после тайм-аута поток
+# check_all_clients продолжает работу: снимает флаг только он сам, поэтому
+# новый /check не запустит второй браузер параллельно первому.
+_check_busy = threading.Event()
+
+
+def _check_in_thread(user_id: int):
+    """Выполняет блокирующую проверку и всегда снимает флаг занятости.
+
+    Снимает флаг именно поток-исполнитель (finally), поэтому исключение или
+    отмена ожидания со стороны event loop не оставляют проверку «залоченной»
+    навсегда.
+    """
+    try:
+        return check_all_clients(user_id)
+    finally:
+        _check_busy.clear()
+
 
 def html_value(value: object) -> str:
     return escape(str(value) if value is not None else "—")
@@ -119,7 +148,7 @@ async def cmd_help(message: Message):
 @router.message(Command("clients"))
 async def cmd_clients(message: Message):
     user_id = message.from_user.id
-    clients = get_all_clients(user_id)
+    clients = await asyncio.to_thread(get_all_clients, user_id)
     if not clients:
         await message.answer("👥 Список клиентов пуст.\n\nДобавьте командой /add или загрузите через /load.")
         return
@@ -135,7 +164,8 @@ async def cmd_clients(message: Message):
 async def cmd_load(message: Message):
     user_id = message.from_user.id
     await message.answer("📂 Загружаю клиентов из CSV...")
-    result = load_clients_from_csv(user_id)
+    # pandas.read_csv + пачка INSERT'ов: блокирующая работа, уводим в поток.
+    result = await asyncio.to_thread(load_clients_from_csv, user_id)
 
     if "error" in result:
         await message.answer(f"❌ {html_value(result['error'])}", parse_mode="HTML")
@@ -183,6 +213,8 @@ async def cmd_add(message: Message, command: CommandObject):
 
     auto_name = f"Клиент (ИНН {inn})"
 
+    # Одиночный INSERT в локальный SQLite занимает микросекунды —
+    # ради него не стоит прыгать в поток; тяжёлый I/O вынесен отдельно.
     if add_client(user_id, inn, auto_name, days_back):
         await message.answer(f"✅ Клиент добавлен: <b>{html_value(auto_name)}</b> (за {html_value(days_back)} дн.)", parse_mode="HTML")
     else:
@@ -198,14 +230,14 @@ async def cmd_del(message: Message, command: CommandObject):
         return
 
     inn = args[0].strip()
-    client = get_client_by_inn(user_id, inn)
+    client = await asyncio.to_thread(get_client_by_inn, user_id, inn)
 
     if not client:
         await message.answer(f"❌ Клиент с ИНН <code>{html_value(inn)}</code> не найден.", parse_mode="HTML")
         return
 
-    cases_deleted = delete_client_cases(user_id, inn)
-    delete_client(user_id, inn)
+    cases_deleted = await asyncio.to_thread(delete_client_cases, user_id, inn)
+    await asyncio.to_thread(delete_client, user_id, inn)
 
     await message.answer(
         f"🗑 Удалён клиент <b>{html_value(client['name'])}</b> (ИНН <code>{html_value(inn)}</code>)\nУдалено дел: {html_value(cases_deleted)}",
@@ -217,18 +249,46 @@ async def cmd_del(message: Message, command: CommandObject):
 async def cmd_check(message: Message):
     user_id = message.from_user.id
 
-    # Проверка блокировки (если уже идет проверка)
-    if _check_lock.locked():
+    # Проверка блокировки (если уже идет проверка или предыдущая ещё
+    # завершается в фоне после тайм-аута)
+    if _check_lock.locked() or _check_busy.is_set():
         await message.answer("⏳ Проверка уже выполняется. Пожалуйста, подождите.")
         return
 
-    # Захватываем блокировку и запускаем проверку
+    # Захватываем блокировку и запускаем проверку.
+    # async with гарантирует release даже при исключении/отмене — дедлока нет.
     async with _check_lock:
+        if _check_busy.is_set():
+            # Пока ждали блокировку, её мог занять другой обработчик.
+            await message.answer("⏳ Проверка уже выполняется. Пожалуйста, подождите.")
+            return
+
+        _check_busy.set()
         await message.answer("🔍 Запускаю проверку. Это может занять несколько минут...")
-        
+
         try:
-            results, errors = await asyncio.to_thread(check_all_clients, user_id)
+            results, errors = await asyncio.wait_for(
+                asyncio.to_thread(_check_in_thread, user_id),
+                timeout=CHECK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Поток с Playwright может продолжать работу, поэтому _check_busy
+            # остаётся выставленным до его фактического завершения.
+            logger.warning(
+                "⏱ Проверка не уложилась в %s с и была прервана.", CHECK_TIMEOUT_SECONDS
+            )
+            await message.answer(
+                "⏰ Проверка прервана из-за тайм-аута "
+                f"({html_value(CHECK_TIMEOUT_SECONDS)} сек.). "
+                "Часть клиентов могла остаться непроверенной — попробуйте позже.",
+                parse_mode="HTML",
+            )
+            return
         except Exception as e:
+            # Поток мог вообще не запуститься — снимаем флаг, чтобы /check
+            # не оказался заблокированным навсегда.
+            _check_busy.clear()
+            logger.exception("Критическая ошибка при запуске проверки")
             await message.answer(f"❌ Критическая ошибка при запуске: {html_value(e)}", parse_mode="HTML")
             return
 
@@ -264,7 +324,8 @@ async def cmd_check(message: Message):
 @router.message(Command("report"))
 async def cmd_report(message: Message):
     user_id = message.from_user.id
-    clients = get_all_clients(user_id)
+    # SQLite-запросы синхронные: выносим их из event loop.
+    clients = await asyncio.to_thread(get_all_clients, user_id)
     
     if not clients:
         await message.answer("👥 Список клиентов пуст. Сначала добавьте их через /add или /load.")
@@ -274,7 +335,7 @@ async def cmd_report(message: Message):
     has_cases = False
 
     for client in clients:
-        cases = get_cases_by_client(user_id, client["inn"])
+        cases = await asyncio.to_thread(get_cases_by_client, user_id, client["inn"])
         
         if cases:
             has_cases = True

@@ -1,13 +1,35 @@
-from playwright.sync_api import sync_playwright
 import json
+import logging
 import os
 from threading import Lock
+
+from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger(__name__)
+
+# === Жёсткие тайм-ауты Playwright (миллисекунды) ===
+# Без них page.goto()/click()/is_visible() могут ждать ответа бесконечно:
+# именно так проверка зависла более чем на 10 часов.
+PAGE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_PAGE_TIMEOUT_MS", "30000"))
+BROWSER_LAUNCH_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_LAUNCH_TIMEOUT_MS", "30000"))
+
+# Внутренний бюджет ожиданий (~45 c), чтобы гарантированно уложиться
+# в 60-секундный жёсткий тайм-аут из core/parser.py.
+NAVIGATION_SETTLE_MS = 3000
+ACTION_SETTLE_MS = 500
+CLICK_RESULT_WAIT_MS = 4000
+VISIBILITY_TIMEOUT_MS = 2000
 
 _cookie_write_lock = Lock()
 
 
 def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
-                             headless: bool = False, offscreen: bool = False) -> dict:
+                            headless: bool = False, offscreen: bool = False) -> dict:
+    """Открывает сайт в Chromium и собирает куки (обход DDoS-Guard).
+
+    Все операции ограничены PAGE_TIMEOUT_MS. Браузер и контекст закрываются
+    в finally, даже если внутри произошла ошибка или тайм-аут.
+    """
     with sync_playwright() as p:
         args = ['--disable-blink-features=AutomationControlled']
         if headless:
@@ -18,13 +40,16 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
         launch_kwargs = {
             "headless": False,
             "args": args,
+            # Браузер не должен запускаться дольше, чем длится вся проверка.
+            "timeout": BROWSER_LAUNCH_TIMEOUT_MS,
         }
         if proxy:
             launch_kwargs["proxy"] = proxy
 
-        print("DEBUG: Запускаю браузер...")
+        logger.info("Запускаю браузер для получения кук...")
         browser = p.chromium.launch(**launch_kwargs)
-        
+        context = None
+
         try:
             context = browser.new_context(
                 user_agent=user_agent,
@@ -33,50 +58,57 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
                 ignore_https_errors=True,
                 viewport={"width": 1366, "height": 768},
             )
+            # Глобальные тайм-ауты: любой вызов без явного timeout
+            # ограничен 30 секундами вместо бесконечного ожидания.
+            context.set_default_timeout(PAGE_TIMEOUT_MS)
             page = context.new_page()
+            page.set_default_timeout(PAGE_TIMEOUT_MS)
 
-            print("DEBUG: Перехожу на сайт...")
+            logger.info("Перехожу на %s", start_url)
             try:
-                page.goto(start_url, wait_until='domcontentloaded', timeout=15000) # Ждем максимум 15 секунд
-                page.wait_for_timeout(5000)
+                page.goto(start_url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT_MS)
+                page.wait_for_timeout(NAVIGATION_SETTLE_MS)
             except Exception as e:
-                print(f"DEBUG: Ошибка загрузки страницы: {e}")
+                logger.warning("Не удалось загрузить страницу: %s", e)
 
-            # === НОВЫЙ БЛОК: Имитация активности человека ===
-            print("DEBUG: Имитирую активность пользователя...")
+            # === Имитация активности человека (обход антибота) ===
             try:
-                # Двигаем мышь и кликаем по пустому месту
                 page.mouse.move(500, 300)
                 page.mouse.click(500, 300)
-                page.wait_for_timeout(1000)
-                
-                # Скроллим страницу вниз
-                page.mouse.wheel(0, 500)
-                page.wait_for_timeout(1000)
-                
-                # Пробуем найти кнопку "Найти" (если она есть на странице)
-                find_btn = page.locator('button[type="submit"]', has_text="Найти")
-                if find_btn.first.is_visible(timeout=3000):
-                    find_btn.first.click()
-                    page.wait_for_timeout(8000) # Ждем 8 секунд после клика
-            except Exception as e:
-                print(f"DEBUG: Ошибка при имитации кликов: {e}")
-            # ====================================================
+                page.wait_for_timeout(ACTION_SETTLE_MS)
 
-            print("DEBUG: Собираю куки...")
+                page.mouse.wheel(0, 500)
+                page.wait_for_timeout(ACTION_SETTLE_MS)
+
+                find_btn = page.locator('button[type="submit"]', has_text="Найти")
+                if find_btn.first.is_visible(timeout=VISIBILITY_TIMEOUT_MS):
+                    find_btn.first.click()
+                    page.wait_for_timeout(CLICK_RESULT_WAIT_MS)
+            except Exception as e:
+                logger.warning("Ошибка при имитации кликов: %s", e)
+            # =====================================================
+
+            logger.info("Собираю куки...")
             cookie_list = context.cookies()
             cookie_dict = {c['name']: c['value'] for c in cookie_list}
-
-            print(f"DEBUG: Собрано кук: {len(cookie_dict)}")
+            logger.info("Собрано кук: %d", len(cookie_dict))
             return {"cookies": cookie_dict, "cookiesRaw": cookie_list}
-            
+
         except Exception as e:
-            print(f"DEBUG: Критическая ошибка внутри Playwright: {e}")
+            logger.error("Критическая ошибка внутри Playwright: %s", e)
             return {"cookies": {}, "cookiesRaw": []}
         finally:
-            # ГАРАНТИРОВАННО закрываем браузер, чтобы он не висел в памяти
-            browser.close()
-            print("DEBUG: Браузер закрыт.")
+            # Гарантированно освобождаем ресурсы, чтобы Chromium не висел в памяти.
+            # Закрытие тоже может бросить исключение — это не должно маскировать
+            # исходную ошибку и не должно оставлять процесс браузера.
+            for resource, name in ((context, "контекст"), (browser, "браузер")):
+                if resource is None:
+                    continue
+                try:
+                    resource.close()
+                except Exception as e:
+                    logger.warning("Не удалось закрыть %s Playwright: %s", name, e)
+            logger.info("Браузер закрыт.")
 
 
 def save_cookies(file_path: str, data: dict) -> None:

@@ -26,7 +26,11 @@ def ensure_playwright_browser():
             browser_path = p.chromium.executable_path
             if not os.path.exists(browser_path):
                 logger.info("⏳ Chromium не найден. Скачиваю...")
-                subprocess.run(["playwright", "install", "chromium"], check=True)
+                subprocess.run(
+                    ["playwright", "install", "chromium"],
+                    check=True,
+                    timeout=900,  # установка не должна вешать запуск бота
+                )
                 logger.info("✅ Chromium установлен!")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка проверки Playwright: {e}")
