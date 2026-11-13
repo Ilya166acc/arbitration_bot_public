@@ -25,11 +25,6 @@ _cookie_write_lock = Lock()
 
 def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
                             headless: bool = False, offscreen: bool = False) -> dict:
-    """Открывает сайт в Chromium и собирает куки (обход DDoS-Guard).
-
-    Все операции ограничены PAGE_TIMEOUT_MS. Браузер и контекст закрываются
-    в finally, даже если внутри произошла ошибка или тайм-аут.
-    """
     with sync_playwright() as p:
         args = ['--disable-blink-features=AutomationControlled']
         if headless:
@@ -40,11 +35,13 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
         launch_kwargs = {
             "headless": False,
             "args": args,
-            # Браузер не должен запускаться дольше, чем длится вся проверка.
             "timeout": BROWSER_LAUNCH_TIMEOUT_MS,
         }
         if proxy:
             launch_kwargs["proxy"] = proxy
+            logger.info(f"🌐 Использую прокси: {proxy.get('server', 'unknown')}") # <--- Логирование прокси!
+        else:
+            logger.info("⚠️ Прокси НЕ используется, прямое подключение.")
 
         logger.info("Запускаю браузер для получения кук...")
         browser = p.chromium.launch(**launch_kwargs)
@@ -58,8 +55,6 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
                 ignore_https_errors=True,
                 viewport={"width": 1366, "height": 768},
             )
-            # Глобальные тайм-ауты: любой вызов без явного timeout
-            # ограничен 30 секундами вместо бесконечного ожидания.
             context.set_default_timeout(PAGE_TIMEOUT_MS)
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT_MS)
@@ -71,64 +66,42 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
             except Exception as e:
                 logger.warning("Не удалось загрузить страницу: %s", e)
 
-            # === Имитация активности человека (обход антибота) ===
+            # === УЛЬТИМАТИВНАЯ ОЧИСТКА ОТ БАННЕРОВ (НАШ ФИКС) ===
+            try:
+                page.evaluate("""
+                    const selectors = ['.b-promo_notification-popup_wrapper', '.b-promo_notification-popup', '.b-promo_notification', '.modal-backdrop', '[class*="overlay"]', '[class*="popup"]'];
+                    selectors.forEach(sel => {
+                        document.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    document.body.style.overflow = 'auto';
+                """)
+                page.wait_for_timeout(1000)
+            except Exception as e:
+                logger.warning("Ошибка при очистке баннеров: %s", e)
+
+            # === ИМИТАЦИЯ И ПОИСК (НАШ ФИКС) ===
             try:
                 page.mouse.move(500, 300)
                 page.mouse.click(500, 300)
                 page.wait_for_timeout(ACTION_SETTLE_MS)
-
                 page.mouse.wheel(0, 500)
                 page.wait_for_timeout(ACTION_SETTLE_MS)
 
-                # Принудительно удаляем всплывающие баннеры, попапы и оверлеи.
-                # Site-wide промо-баннер перекрывает кнопку «Найти», из-за чего
-                # клик не проходит, результаты не загружаются и DDoS-Guard
-                # выдаёт неполный набор кук (33 вместо валидного набора).
-                try:
-                    page.evaluate("""
-                        (() => {
-                            const selectors = [
-                                '.b-promo_notification-popup_wrapper',
-                                '.b-promo_notification-popup',
-                                '.b-promo_notification',
-                                '.modal-backdrop',
-                            ];
-                            selectors.forEach(sel => {
-                                document.querySelectorAll(sel).forEach(el => el.remove());
-                            });
-                            document.querySelectorAll('*').forEach(el => {
-                                const cls = el.getAttribute('class') || '';
-                                if (/overlay|popup/i.test(cls)) {
-                                    el.remove();
-                                }
-                            });
-                            document.body.style.overflow = 'auto';
-                        })();
-                    """)
-                    page.wait_for_timeout(ACTION_SETTLE_MS)
-                except Exception:
-                    pass
-
                 find_btn = page.locator('button[type="submit"]', has_text="Найти")
                 if find_btn.first.is_visible(timeout=VISIBILITY_TIMEOUT_MS):
-                    find_btn.first.click(force=True)  # force=True игнорирует перекрывающие слои
-                    # Не ждём фиксированное время, а дожидаемся реальной отрисовки
-                    # таблицы результатов (или сообщения «ничего не найдено»):
-                    # именно финальный AJAX-ответ заставляет DDoS-Guard выдать
-                    # полный набор валидных кук.
+                    # force=True обходит любые невидимые преграды
+                    find_btn.first.click(force=True) 
+                    logger.info("Нажали кнопку 'Найти', ждем загрузки результатов...")
+                    
                     try:
-                        page.wait_for_selector(
-                            'a.num_case, .b-found-nothing', timeout=15000
-                        )
-                    except Exception as e:
-                        logger.warning("Результаты поиска не появились за 15 с: %s", e)
-                        # Даже если селектор не дождались, даём странице
-                        # дополнительное время на завершение запросов.
-                        page.wait_for_timeout(CLICK_RESULT_WAIT_MS)
+                        page.wait_for_selector('a.num_case, .b-found-nothing', timeout=15000)
+                        logger.info("Результаты поиска успешно загрузились!")
+                    except Exception:
+                        logger.warning("Не дождались таблицы результатов.")
+                        
                     page.wait_for_timeout(3000)
             except Exception as e:
-                logger.warning("Ошибка при имитации кликов: %s", e)
-            # =====================================================
+                logger.warning("Ошибка при поиске: %s", e)
 
             logger.info("Собираю куки...")
             cookie_list = context.cookies()
@@ -140,9 +113,6 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
             logger.error("Критическая ошибка внутри Playwright: %s", e)
             return {"cookies": {}, "cookiesRaw": []}
         finally:
-            # Гарантированно освобождаем ресурсы, чтобы Chromium не висел в памяти.
-            # Закрытие тоже может бросить исключение — это не должно маскировать
-            # исходную ошибку и не должно оставлять процесс браузера.
             for resource, name in ((context, "контекст"), (browser, "браузер")):
                 if resource is None:
                     continue
