@@ -18,7 +18,10 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from urllib.parse import unquote, urlparse
 from zoneinfo import ZoneInfo
+
+from config import PROXY_URL
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +62,76 @@ class CookieRefreshTimeout(TimeoutError):
 
 
 
-def _refresh_entry(headless, offscreen, queue):
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks4"}
+
+
+def _mask_proxy_url(proxy_url: str | None) -> str:
+    """Скрывает логин/пароль прокси в сообщениях логов."""
+    if not proxy_url:
+        return "<не задан>"
     try:
-        data = get_cookies_via_browser(START_URL, None, USER_AGENT, headless=headless, offscreen=offscreen)
+        parsed = urlparse(proxy_url)
+        host = parsed.hostname or "?"
+        port = f":{parsed.port}" if parsed.port else ""
+        if parsed.username or parsed.password:
+            return f"{parsed.scheme or 'http'}://***:***@{host}{port}"
+    except ValueError:
+        pass
+    return "<некорректный URL>"
+
+
+def _build_playwright_proxy(proxy_url: str | None) -> dict | None:
+    """Преобразует PROXY_URL в формат proxy для Playwright.
+
+    Пример: http://user:pass@ru.proxy.rucaptcha.com:2334
+    -> {"server": "http://ru.proxy.rucaptcha.com:2334",
+        "username": "user", "password": "pass"}
+
+    Если PROXY_URL не задан или некорректен — возвращает None (прямое
+    соединение), потому что без прокси парсер хотя бы попробует работать.
+    """
+    if not proxy_url:
+        logger.error(
+            "PROXY_URL не задан — Playwright подключается к kad.arbitr.ru напрямую. "
+            "Если сайт блокирует ваш регион, задайте PROXY_URL."
+        )
+        return None
+
+    try:
+        parsed = urlparse(proxy_url)
+        scheme = (parsed.scheme or "http").lower()
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            raise ValueError(f"неподдерживаемая схема «{scheme}»")
+        if not parsed.hostname:
+            raise ValueError("не указан хост прокси")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"некорректный порт ({exc})") from exc
+        if not port:
+            raise ValueError("не указан порт прокси")
+
+        proxy = {"server": f"{scheme}://{parsed.hostname}:{port}"}
+        if parsed.username:
+            proxy["username"] = unquote(parsed.username)
+        if parsed.password:
+            proxy["password"] = unquote(parsed.password)
+
+        logger.info("Playwright будет использовать прокси %s", proxy["server"])
+        return proxy
+    except ValueError as exc:
+        logger.error(
+            "Некорректный PROXY_URL %s: %s. Продолжаю без прокси (прямое соединение).",
+            _mask_proxy_url(proxy_url), exc,
+        )
+        return None
+
+
+def _refresh_entry(headless, offscreen, queue, proxy):
+    try:
+        data = get_cookies_via_browser(
+            START_URL, proxy, USER_AGENT, headless=headless, offscreen=offscreen
+        )
         queue.put(("ok", data))
     except BaseException as e:
         queue.put(("err", repr(e)))
@@ -69,12 +139,17 @@ def _refresh_entry(headless, offscreen, queue):
 
 def refresh_cookies() -> None:
     logger.info("Обновляю куки через Playwright (процесс)...")
+    proxy = _build_playwright_proxy(PROXY_URL)
     if not _refresh_guard.acquire(blocking=False):
         raise CookieRefreshTimeout("Previous refresh still running")
 
     queue = mp.Queue()
     is_win = platform.system() == "Windows"
-    proc = mp.Process(target=_refresh_entry, args=(not is_win, is_win, queue), daemon=True)
+    proc = mp.Process(
+        target=_refresh_entry,
+        args=(not is_win, is_win, queue, proxy),
+        daemon=True,
+    )
     proc.start()
 
     try:
@@ -92,8 +167,27 @@ def refresh_cookies() -> None:
         proc.join(0)
 
     if status == "err":
+        if proxy:
+            logger.error(
+                "Ошибка Playwright через прокси %s: %s. "
+                "Проверьте PROXY_URL, логин/пароль и доступность прокси.",
+                proxy["server"], payload,
+            )
+            raise CookieRefreshError(
+                f"Не удалось обновить куки через прокси {proxy['server']}: {payload}"
+            )
         raise CookieRefreshError(payload)
     if not payload.get("cookies"):
+        if proxy:
+            logger.error(
+                "Прокси %s вернул пустой набор кук. Вероятно, неверный логин/пароль, "
+                "исчерпан трафик или прокси недоступен.",
+                proxy["server"],
+            )
+            raise CookieRefreshError(
+                f"Прокси {proxy['server']} не вернул куки — проверьте PROXY_URL "
+                "(логин, пароль, порт и остаток трафика)"
+            )
         raise CookieRefreshError("empty cookie set")
 
     save_cookies(COOKIES_FILE, payload)

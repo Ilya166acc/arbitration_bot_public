@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -8,6 +9,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from services.cookies import load_cookies
+
+try:
+    from config import PROXY_URL
+except ImportError:  # запуск enricher как самостоятельного проекта (cd enricher)
+    PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 
 # === Сетевые тайм-ауты (секунды) ===
 # connect/read разделены: «сайт не отвечает» и «сайт долго думает» —
@@ -28,6 +34,78 @@ class CookieExpiredError(Exception):
 
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4", "socks4a"}
+
+# Чтобы при каждом запросе не писать одну и ту же ошибку в лог.
+_proxy_warning_logged = False
+
+
+def _get_proxy_url() -> str | None:
+    """Возвращает актуальный PROXY_URL (config или переменная окружения)."""
+    return PROXY_URL or os.getenv("PROXY_URL", "").strip() or None
+
+
+def _mask_proxy_url(proxy_url: str | None) -> str:
+    """Скрывает логин/пароль прокси в сообщениях логов."""
+    if not proxy_url:
+        return "<не задан>"
+    try:
+        parsed = urlparse(proxy_url)
+        host = parsed.hostname or "?"
+        port = f":{parsed.port}" if parsed.port else ""
+        if parsed.username or parsed.password:
+            return f"{parsed.scheme or 'http'}://***:***@{host}{port}"
+    except ValueError:
+        pass
+    return "<некорректный URL>"
+
+
+def build_proxies(proxy_url: str | None = None) -> dict | None:
+    """Собирает словарь proxies для requests из PROXY_URL.
+
+    Пример: http://user:pass@ru.proxy.rucaptcha.com:2334
+    -> {"http": "...", "https": "..."}
+
+    Если PROXY_URL не задан или некорректен — логирует ошибку и возвращает
+    None: запрос пойдёт напрямую (если сеть это позволяет).
+    """
+    global _proxy_warning_logged
+
+    url = proxy_url if proxy_url is not None else _get_proxy_url()
+    if not url:
+        if not _proxy_warning_logged:
+            logger.error(
+                "PROXY_URL не задан — запросы к kad.arbitr.ru идут напрямую, без прокси. "
+                "Если сайт блокирует ваш регион, задайте PROXY_URL."
+            )
+            _proxy_warning_logged = True
+        return None
+
+    try:
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in SUPPORTED_PROXY_SCHEMES:
+            raise ValueError(f"неподдерживаемая схема «{scheme or 'нет'}»")
+        if not parsed.hostname:
+            raise ValueError("не указан хост прокси")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError(f"некорректный порт ({exc})") from exc
+        if not port:
+            raise ValueError("не указан порт прокси")
+    except ValueError as exc:
+        if not _proxy_warning_logged:
+            logger.error(
+                "Некорректный PROXY_URL %s: %s. Запросы пойдут напрямую, без прокси.",
+                _mask_proxy_url(url), exc,
+            )
+            _proxy_warning_logged = True
+        return None
+
+    logger.info("Использую прокси %s", _mask_proxy_url(url))
+    return {"http": url, "https": url}
 
 
 def build_session() -> requests.Session:
@@ -78,6 +156,13 @@ def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
         raise
     except requests.Timeout as e:
         logger.error("Тайм-аут запроса к KAD (%s с): %s", timeout, e)
+        raise
+    except requests.exceptions.ProxyError as e:
+        logger.error(
+            "Ошибка прокси %s при запросе к KAD: %s. "
+            "Проверьте PROXY_URL, логин/пароль и доступность прокси.",
+            _mask_proxy_url(_get_proxy_url()), e,
+        )
         raise
     except requests.RequestException as e:
         logger.error("Сетевая ошибка при запросе к KAD: %s", e)
@@ -189,7 +274,7 @@ def build_cases_request(page: int, count: int, courts: list[str] | None = None,
         'Referer': 'https://kad.arbitr.ru/',
     }
 
-    proxies = None
+    proxies = build_proxies()
 
     payload = {
         "Page": page,

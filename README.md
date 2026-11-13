@@ -39,6 +39,23 @@ Playwright синхронный и не умеет прерывать собст
 `BOT_TOKEN`, `ALLOWED_USER_IDS`, `CHECK_INTERVAL_DAYS` — базовая конфигурация.
 Тайм-ауты из таблицы выше можно переопределить одноимёнными переменными окружения.
 
+### Прокси (обход гео-блокировки kad.arbitr.ru)
+
+Если kad.arbitr.ru недоступен из вашего региона, задайте `PROXY_URL`
+(например, residential-прокси RuCaptcha):
+
+```dotenv
+# HTTP
+PROXY_URL=http://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2334
+# или SOCKS5 (для requests нужен PySocks, он уже в requirements.txt)
+PROXY_URL=socks5://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2333
+```
+
+Прокси используется и для Playwright (обновление кук), и для HTTP-запросов
+поиска дел. Если переменная не задана, приложение работает напрямую.
+Если прокси недоступен или логин/пароль неверны, в логе будет явная ошибка,
+а проверка завершится исключением (молчаливого перехода на другой маршрут нет).
+
 ## Запуск
 
 ```bash

@@ -10,6 +10,12 @@ GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
 # Список ID пользователей, которым разрешен доступ
 ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 
+# === Прокси (RuCaptcha residential) ===
+# Формат: http://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2334
+# Для SOCKS5: socks5://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2333
+# Если не задан — работаем напрямую (без прокси).
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+
 # === Пути к файлам ===
 CLIENTS_CSV = "data/clients.csv"
 DATABASE_PATH = "data/bot.db"
