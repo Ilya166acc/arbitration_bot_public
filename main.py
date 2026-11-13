@@ -2,14 +2,15 @@ import asyncio
 import logging
 import os
 import subprocess
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramNetworkError
-from aiogram.types import ErrorEvent
+from aiogram.types import ErrorEvent, TelegramObject
 
-from config import BOT_TOKEN, LOG_LEVEL
+from config import ALLOWED_USER_IDS, BOT_TOKEN, LOG_LEVEL
 from bot.handlers import router
 from database.models import create_tables  # <-- ИМПОРТ
 
@@ -36,6 +37,21 @@ def ensure_playwright_browser():
                 logger.info("✅ Chromium установлен!")
     except Exception as e:
         logger.warning(f"⚠️ Ошибка проверки Playwright: {e}")
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        user_id = user.id if user else None
+        if not ALLOWED_USER_IDS or user_id not in ALLOWED_USER_IDS:
+            logger.warning(f"Denied access for user_id={user_id}")
+            return
+        return await handler(event, data)
 
 
 async def on_error(event: ErrorEvent) -> bool:
@@ -68,6 +84,7 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.errors.register(on_error)
+    dp.update.outer_middleware(AccessMiddleware())
     dp.include_router(router)
 
     await dp.start_polling(bot)

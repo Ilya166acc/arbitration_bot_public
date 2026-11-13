@@ -3,6 +3,7 @@
 Все операции привязаны к user_id (Telegram ID пользователя).
 """
 import sqlite3
+from contextlib import closing
 from typing import List, Dict, Optional
 from config import DATABASE_PATH
 
@@ -31,14 +32,12 @@ def add_client(user_id: int, inn: str, name: str, days_back: int = 30) -> bool:
 
 
 def get_all_clients(user_id: int) -> List[Dict]:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, inn, name, days_back, added_at FROM clients WHERE user_id = ? ORDER BY name",
-        (user_id,)
-    )
-    rows = cursor.fetchall()
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute(
+            "SELECT id, inn, name, days_back, added_at FROM clients WHERE user_id = ? ORDER BY name",
+            (user_id,)
+        )
+        rows = cur.fetchall()
     return [
         {"id": r[0], "inn": r[1], "name": r[2], "days_back": r[3], "added_at": r[4]}
         for r in rows
@@ -46,36 +45,30 @@ def get_all_clients(user_id: int) -> List[Dict]:
 
 
 def get_client_by_inn(user_id: int, inn: str) -> Optional[Dict]:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, inn, name, days_back FROM clients WHERE user_id = ? AND inn = ?",
-        (user_id, inn)
-    )
-    row = cursor.fetchone()
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute(
+            "SELECT id, inn, name, days_back FROM clients WHERE user_id = ? AND inn = ?",
+            (user_id, inn)
+        )
+        row = cur.fetchone()
     if row:
         return {"id": row[0], "inn": row[1], "name": row[2], "days_back": row[3]}
     return None
 
 
 def delete_client(user_id: int, inn: str) -> bool:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM clients WHERE user_id = ? AND inn = ?", (user_id, inn))
-    conn.commit()
-    deleted = cursor.rowcount > 0
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute("DELETE FROM clients WHERE user_id = ? AND inn = ?", (user_id, inn))
+        conn.commit()
+        deleted = cur.rowcount > 0
     return deleted
 
 
 def delete_client_cases(user_id: int, inn: str) -> int:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM cases WHERE user_id = ? AND client_inn = ?", (user_id, inn))
-    conn.commit()
-    deleted = cursor.rowcount
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute("DELETE FROM cases WHERE user_id = ? AND client_inn = ?", (user_id, inn))
+        conn.commit()
+        deleted = cur.rowcount
     return deleted
 
 
@@ -111,27 +104,23 @@ def add_case(user_id: int, case_data: Dict) -> bool:
 
 
 def case_exists(user_id: int, case_number: str) -> bool:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT 1 FROM cases WHERE user_id = ? AND case_number = ?",
-        (user_id, case_number)
-    )
-    exists = cursor.fetchone() is not None
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute(
+            "SELECT 1 FROM cases WHERE user_id = ? AND case_number = ?",
+            (user_id, case_number)
+        )
+        exists = cur.fetchone() is not None
     return exists
 
 
 def get_cases_by_client(user_id: int, inn: str) -> List[Dict]:
-    conn = _connect()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT case_number, court, plaintiff, defendant, claim_amount, 
-               receipt_date, url, ai_summary, found_at
-        FROM cases WHERE user_id = ? AND client_inn = ? ORDER BY found_at DESC
-    """, (user_id, inn))
-    rows = cursor.fetchall()
-    conn.close()
+    with closing(_connect()) as conn, closing(conn.cursor()) as cur:
+        cur.execute("""
+            SELECT case_number, court, plaintiff, defendant, claim_amount, 
+                   receipt_date, url, ai_summary, found_at
+            FROM cases WHERE user_id = ? AND client_inn = ? ORDER BY found_at DESC
+        """, (user_id, inn))
+        rows = cur.fetchall()
     return [
         {
             "case_number": r[0], "court": r[1], "plaintiff": r[2],

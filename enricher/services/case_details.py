@@ -1,7 +1,6 @@
 import hashlib
 import io
 import re
-import sys
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,8 +25,7 @@ def fetch_case_html(case_url: str, cookies: dict, headers: dict, proxies: dict,
             print("----------------------------------------")
             print("HTTP 451 from kad.arbitr.ru. Запустите обновление кук: python main.py --mode update-cookies")
             print("----------------------------------------")
-            sys.exit()
-            return ""
+            raise RuntimeError("HTTP 451 while fetching case details")
         raise
     return resp.text
 

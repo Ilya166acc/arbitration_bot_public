@@ -10,6 +10,8 @@ def create_tables():
 
     conn = sqlite3.connect(DATABASE_PATH, timeout=30)
     cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
 
     # === Таблица клиентов ===
     cursor.execute("""

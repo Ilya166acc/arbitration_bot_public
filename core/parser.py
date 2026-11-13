@@ -9,6 +9,7 @@
 """
 import concurrent.futures
 import logging
+import multiprocessing as mp
 import os
 import platform
 import random
@@ -57,82 +58,46 @@ class CookieRefreshTimeout(TimeoutError):
     """Обновление кук не уложилось в отведённое время."""
 
 
-def _refresh_worker(headless: bool, offscreen: bool) -> dict:
-    """Тело фонового потока: браузер + сбор кук."""
+
+def _refresh_entry(headless, offscreen, queue):
     try:
-        return get_cookies_via_browser(
-            start_url=START_URL,
-            proxy=None,
-            user_agent=USER_AGENT,
-            headless=headless,
-            offscreen=offscreen,
-        )
-    finally:
-        # Флаг занятости снимает именно поток-исполнитель: если его abandon-ят
-        # по тайм-ауту, новые попытки не будут наслаиваться.
-        _refresh_guard.release()
+        data = get_cookies_via_browser(START_URL, None, USER_AGENT, headless=headless, offscreen=offscreen)
+        queue.put(("ok", data))
+    except BaseException as e:
+        queue.put(("err", repr(e)))
 
 
-def refresh_cookies(timeout: float | None = None) -> None:
-    """Обновляет cookies.json через Playwright с жёстким тайм-аутом.
-
-    Работает в отдельном потоке: `future.result(timeout=...)` не даёт боту
-    провисеть дольше `timeout` секунд. По истечении поднимается
-    CookieRefreshTimeout (наследник TimeoutError).
-    """
-    timeout = COOKIE_REFRESH_TIMEOUT if timeout is None else timeout
-
+def refresh_cookies() -> None:
+    logger.info("Обновляю куки через Playwright (процесс)...")
     if not _refresh_guard.acquire(blocking=False):
-        raise CookieRefreshTimeout(
-            "Предыдущая попытка обновления кук всё ещё не завершилась"
-        )
+        raise CookieRefreshTimeout("Previous refresh still running")
 
-    logger.info("🔁 Обновляю куки через Playwright (тайм-аут %.0f с)...", timeout)
-    is_windows = platform.system() == "Windows"
-
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cookie-refresh")
-    try:
-        future = executor.submit(
-            _refresh_worker,
-            headless=not is_windows,   # На Linux будет True
-            offscreen=is_windows,      # На Windows будет True
-        )
-    except BaseException:
-        # Задача не встала в очередь — поток флаг не снимет, делаем это сами.
-        _refresh_guard.release()
-        executor.shutdown(wait=False)
-        raise
+    queue = mp.Queue()
+    is_win = platform.system() == "Windows"
+    proc = mp.Process(target=_refresh_entry, args=(not is_win, is_win, queue), daemon=True)
+    proc.start()
 
     try:
-        data = future.result(timeout=timeout)
-    except (TimeoutError, concurrent.futures.TimeoutError) as exc:
-        if not future.done():
-            # Жёсткий тайм-аут: поток всё ещё работает (зависший браузер).
-            future.cancel()
-            logger.critical(
-                "⛔ Playwright не уложился в %.0f с — прерываю обновление кук.",
-                timeout,
-            )
-            raise CookieRefreshTimeout(
-                f"Обновление кук через Playwright не завершилось за {timeout:.0f} с"
-            ) from exc
-        # Поток завершился, но внутри Playwright случился собственный TimeoutError.
-        logger.error("❌ Playwright завершился с тайм-аутом: %s", exc)
-        raise CookieRefreshError(f"Ошибка Playwright при обновлении кук: {exc}") from exc
+        status, payload = queue.get(timeout=COOKIE_REFRESH_TIMEOUT)
     except Exception:
-        logger.exception("❌ Не удалось получить куки через Playwright")
-        raise
-    else:
-        cookies = (data or {}).get("cookies") or {}
-        if not cookies:
-            raise CookieRefreshError("Playwright вернул пустой набор кук")
-        save_cookies(COOKIES_FILE, data)
-        logger.info("✅ Куки обновлены: %d шт.", len(cookies))
+        logger.error("Процесс обновления куки завис. Убиваю.")
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        raise CookieRefreshTimeout("Refresh timed out")
     finally:
-        # wait=False: поток с зависшим браузером не должен блокировать
-        # вызывающий код. cancel_futures намеренно не используется —
-        # задача должна выполниться, иначе _refresh_guard останется занятым.
-        executor.shutdown(wait=False)
+        _refresh_guard.release()
+        proc.join(0)
+
+    if status == "err":
+        raise CookieRefreshError(payload)
+    if not payload.get("cookies"):
+        raise CookieRefreshError("empty cookie set")
+
+    save_cookies(COOKIES_FILE, payload)
+    logger.info(f"Куки обновлены: {len(payload.get('cookies', {}))} шт.")
 
 
 def fetch_cases_by_inn(inn: str, days_back: int = 30, cookies_file: str = COOKIES_FILE,

@@ -265,7 +265,7 @@ async def cmd_add(message: Message, command: CommandObject):
 
     # Одиночный INSERT в локальный SQLite занимает микросекунды —
     # ради него не стоит прыгать в поток; тяжёлый I/O вынесен отдельно.
-    if add_client(user_id, inn, auto_name, days_back):
+    if await asyncio.to_thread(add_client, user_id, inn, auto_name, days_back):
         await message.answer(f"✅ Клиент добавлен: <b>{html_value(auto_name)}</b> (за {html_value(days_back)} дн.)", parse_mode="HTML")
     else:
         await message.answer(f"ℹ️ Клиент с ИНН <code>{html_value(inn)}</code> уже есть.", parse_mode="HTML")
@@ -344,8 +344,8 @@ async def cmd_check(message: Message):
 
         # Если во время проверки были ошибки, выводим их
         if errors:
-            error_text = "⚠️ <b>Во время проверки возникли ошибки:</b>\n" + "\n".join(html_value(error) for error in errors)
-            await message.answer(error_text, parse_mode="HTML")
+            error_text = "⚠️ Во время проверки возникли ошибки:\n" + "\n".join(errors)
+            await send_long_message(message, error_text)
 
         if not results:
             if not errors:
