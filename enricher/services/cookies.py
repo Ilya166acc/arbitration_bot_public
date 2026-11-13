@@ -128,3 +128,15 @@ def load_cookies(file_path: str) -> dict:
         data = json.load(f)
     # Всегда возвращаем именно словарь кук (может быть пустым)
     return data.get('cookies', {})
+
+def save_cookies(file_path: str, data: dict) -> None:
+    """Атомарно сохраняет куки в файл, чтобы избежать чтения полусырого файла."""
+    tmp_path = os.fspath(file_path) + ".tmp"
+    with _cookie_write_lock:
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, file_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
