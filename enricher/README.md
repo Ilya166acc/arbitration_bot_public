@@ -6,6 +6,11 @@
 - Python 3.11+
 - Windows PowerShell/CLI
 
+Если kad.arbitr.ru недоступен из вашего региона, задайте прокси через переменную
+окружения `PROXY_URL` (формат `http://USER:PASSWORD@HOST:PORT`; для SOCKS5 —
+`socks5://...` и установленный `PySocks`). Переменная используется и для requests,
+и для Playwright.
+
 Установите зависимости:
 ```bash
 pip install -r requirements.txt

@@ -6,6 +6,7 @@ from html import escape
 
 from aiogram.filters.command import CommandObject
 from aiogram import Router
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
@@ -72,6 +73,12 @@ def is_valid_inn(inn: str) -> bool:
 router = Router()
 MAX_MESSAGE_LENGTH = 3800
 
+# Сеть до api.telegram.org периодически рвётся (Connection reset by peer).
+# Такой сбой не должен обрывать отправку отчёта и ронять обработчик:
+# до трёх попыток с паузой 3 секунды.
+SEND_MAX_ATTEMPTS = 3
+SEND_RETRY_DELAY_SECONDS = 3
+
 
 def split_report(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
     if len(text) <= max_len:
@@ -98,6 +105,35 @@ def split_report(text: str, max_len: int = MAX_MESSAGE_LENGTH) -> list[str]:
     return parts
 
 
+async def _answer_with_retry(message: Message, text: str,
+                             parse_mode: str | None = "HTML") -> None:
+    """Отправляет одно сообщение, повторяя попытку при сетевых сбоях Telegram.
+
+    После SEND_MAX_ATTEMPTS неудач исключение пробрасывается выше: его
+    залогирует вызывающий код или глобальный обработчик ошибок в main.py.
+    """
+    last_error: Exception | None = None
+
+    for attempt in range(1, SEND_MAX_ATTEMPTS + 1):
+        try:
+            await message.answer(text, parse_mode=parse_mode)
+            return
+        except TelegramNetworkError as e:
+            last_error = e
+            logger.warning(
+                "🌐 Сетевая ошибка Telegram (попытка %d/%d): %s",
+                attempt, SEND_MAX_ATTEMPTS, e,
+            )
+            if attempt < SEND_MAX_ATTEMPTS:
+                await asyncio.sleep(SEND_RETRY_DELAY_SECONDS)
+
+    logger.error(
+        "❌ Не удалось отправить сообщение после %d попыток: %s",
+        SEND_MAX_ATTEMPTS, last_error,
+    )
+    raise last_error
+
+
 async def send_long_message(message: Message, text: str) -> None:
     parts = split_report(text)
     total = len(parts)
@@ -108,7 +144,21 @@ async def send_long_message(message: Message, text: str) -> None:
         else:
             header = ""
 
-        await message.answer(header + part, parse_mode="HTML")
+        try:
+            # Ретраи при сетевых сбоях уже внутри _answer_with_retry.
+            await _answer_with_retry(message, header + part, parse_mode="HTML")
+        except TelegramNetworkError:
+            # Сеть так и не восстановилась за 3 попытки — пробрасываем,
+            # чтобы сбой был залогирован, а не проглочен молча.
+            raise
+        except Exception as e:
+            # TelegramBadRequest и прочие ошибки разметки: повторяем без HTML,
+            # чтобы текст отчёта всё равно дошёл до пользователя.
+            logger.warning(
+                "⚠️ Не удалось отправить сообщение с HTML (%s). "
+                "Повторяю без parse_mode.", e,
+            )
+            await _answer_with_retry(message, header + part, parse_mode=None)
 
         if i < total:
             await asyncio.sleep(0.5)
@@ -215,7 +265,7 @@ async def cmd_add(message: Message, command: CommandObject):
 
     # Одиночный INSERT в локальный SQLite занимает микросекунды —
     # ради него не стоит прыгать в поток; тяжёлый I/O вынесен отдельно.
-    if add_client(user_id, inn, auto_name, days_back):
+    if await asyncio.to_thread(add_client, user_id, inn, auto_name, days_back):
         await message.answer(f"✅ Клиент добавлен: <b>{html_value(auto_name)}</b> (за {html_value(days_back)} дн.)", parse_mode="HTML")
     else:
         await message.answer(f"ℹ️ Клиент с ИНН <code>{html_value(inn)}</code> уже есть.", parse_mode="HTML")
@@ -294,8 +344,8 @@ async def cmd_check(message: Message):
 
         # Если во время проверки были ошибки, выводим их
         if errors:
-            error_text = "⚠️ <b>Во время проверки возникли ошибки:</b>\n" + "\n".join(html_value(error) for error in errors)
-            await message.answer(error_text, parse_mode="HTML")
+            error_text = "⚠️ Во время проверки возникли ошибки:\n" + "\n".join(errors)
+            await send_long_message(message, error_text)
 
         if not results:
             if not errors:
