@@ -66,9 +66,16 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
 
             logger.info("Перехожу на %s", start_url)
             try:
-                page.goto(start_url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT_MS)
+                response = page.goto(start_url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT_MS)
+                if proxy and response is not None and response.status == 407:
+                    raise RuntimeError("Proxy authentication required (HTTP 407)")
                 page.wait_for_timeout(NAVIGATION_SETTLE_MS)
             except Exception as e:
+                if proxy:
+                    # С настроенным прокси нельзя молча продолжать с пустыми
+                    # куками: ошибка авторизации/туннеля должна дойти до бота.
+                    logger.error("Не удалось загрузить страницу через прокси: %s", e)
+                    raise
                 logger.warning("Не удалось загрузить страницу: %s", e)
 
             # === Имитация активности человека (обход антибота) ===
@@ -96,6 +103,9 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
 
         except Exception as e:
             logger.error("Критическая ошибка внутри Playwright: %s", e)
+            if proxy:
+                # Ошибки прокси пробрасываем, а не маскируем пустым набором кук.
+                raise
             return {"cookies": {}, "cookiesRaw": []}
         finally:
             # Гарантированно освобождаем ресурсы, чтобы Chromium не висел в памяти.

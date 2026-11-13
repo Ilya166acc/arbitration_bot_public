@@ -3,6 +3,6 @@ apscheduler==3.10.4
 pandas==2.2.3
 python-dotenv==1.0.1
 gigachat==0.1.20
-requests==2.32.3
+requests[socks]==2.32.3
 beautifulsoup4==4.12.3
 playwright==1.48.0

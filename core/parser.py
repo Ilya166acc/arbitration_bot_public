@@ -33,6 +33,8 @@ COOKIES_FILE = os.path.join(ENRICHER_DIR, "cookies.json")
 # дальше начинается зависание бота (инцидент: >10 часов ожидания).
 COOKIE_REFRESH_TIMEOUT = float(os.getenv("COOKIE_REFRESH_TIMEOUT", "60"))
 
+from config import PROXY_URL
+from core.proxy import parse_proxy_url, redact_proxy_error
 from services.cases import get_cases, CookieExpiredError  # type: ignore
 from services.cookies import get_cookies_via_browser, save_cookies  # type: ignore
 
@@ -57,12 +59,12 @@ class CookieRefreshTimeout(TimeoutError):
     """Обновление кук не уложилось в отведённое время."""
 
 
-def _refresh_worker(headless: bool, offscreen: bool) -> dict:
+def _refresh_worker(headless: bool, offscreen: bool, proxy: dict | None = None) -> dict:
     """Тело фонового потока: браузер + сбор кук."""
     try:
         return get_cookies_via_browser(
             start_url=START_URL,
-            proxy=None,
+            proxy=proxy,
             user_agent=USER_AGENT,
             headless=headless,
             offscreen=offscreen,
@@ -81,6 +83,8 @@ def refresh_cookies(timeout: float | None = None) -> None:
     CookieRefreshTimeout (наследник TimeoutError).
     """
     timeout = COOKIE_REFRESH_TIMEOUT if timeout is None else timeout
+    proxy_settings = parse_proxy_url(PROXY_URL)
+    proxy = proxy_settings.as_playwright() if proxy_settings else None
 
     if not _refresh_guard.acquire(blocking=False):
         raise CookieRefreshTimeout(
@@ -96,6 +100,7 @@ def refresh_cookies(timeout: float | None = None) -> None:
             _refresh_worker,
             headless=not is_windows,   # На Linux будет True
             offscreen=is_windows,      # На Windows будет True
+            proxy=proxy,
         )
     except BaseException:
         # Задача не встала в очередь — поток флаг не снимет, делаем это сами.
@@ -119,7 +124,17 @@ def refresh_cookies(timeout: float | None = None) -> None:
         # Поток завершился, но внутри Playwright случился собственный TimeoutError.
         logger.error("❌ Playwright завершился с тайм-аутом: %s", exc)
         raise CookieRefreshError(f"Ошибка Playwright при обновлении кук: {exc}") from exc
-    except Exception:
+    except Exception as exc:
+        if proxy_settings is not None:
+            safe_error = redact_proxy_error(exc, proxy_settings.url)
+            logger.error(
+                "❌ Прокси %s не сработал при обновлении кук: %s",
+                proxy_settings.server,
+                safe_error,
+            )
+            raise CookieRefreshError(
+                f"Прокси {proxy_settings.server} не сработал при обновлении кук: {safe_error}"
+            ) from exc
         logger.exception("❌ Не удалось получить куки через Playwright")
         raise
     else:

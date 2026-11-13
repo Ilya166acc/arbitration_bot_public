@@ -7,6 +7,11 @@ load_dotenv()
 # === Секреты ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+# Прокси для kad.arbitr.ru (RuCaptcha residential и совместимые).
+# Пример: http://USER:PASSWORD@ru.proxy.rucaptcha.com:2334
+# Для SOCKS5: socks5://USER:PASSWORD@ru.proxy.rucaptcha.com:2333
+# Если переменная не задана или некорректна, используется прямое соединение.
+PROXY_URL = os.getenv("PROXY_URL")
 # Список ID пользователей, которым разрешен доступ
 ALLOWED_USER_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()]
 

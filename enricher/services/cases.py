@@ -1,12 +1,20 @@
 import json
 import logging
 import os
+import sys
 
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# enricher может запускаться и как отдельный CLI из своей папки.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from config import PROXY_URL
+from core.proxy import parse_proxy_url, redact_proxy_error
 from services.cookies import load_cookies
 
 # === Сетевые тайм-ауты (секунды) ===
@@ -25,6 +33,10 @@ RETRY_STATUSES = (429, 500, 502, 503, 504)
 class CookieExpiredError(Exception):
     """Куки протухли — нужно обновить через Playwright."""
     pass
+
+
+class ProxyConnectionError(RuntimeError):
+    """Запрос через настроенный прокси не выполнен."""
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +75,7 @@ def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
     """
     logger.info(f"Requesting cases: url={url} page={payload.get('Page')} count={payload.get('Count')}")
     timeout = timeout or DEFAULT_TIMEOUT
+    proxy_url = (proxies or {}).get("https") or (proxies or {}).get("http")
 
     try:
         resp = session.post(
@@ -74,13 +87,37 @@ def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
         status = getattr(getattr(e, 'response', None), 'status_code', None)
         if status == 451:
             raise CookieExpiredError("Куки протухли (HTTP 451)")
+        if status == 407:
+            safe_error = redact_proxy_error(e, proxy_url)
+            logger.error("Прокси требует авторизацию (HTTP 407): %s", safe_error)
+            raise ProxyConnectionError(
+                f"Прокси требует авторизацию (HTTP 407): {safe_error}"
+            ) from e
         logger.error("KAD ответил ошибкой статуса %s", status)
         raise
+    except requests.ProxyError as e:
+        safe_error = redact_proxy_error(e, proxy_url)
+        logger.error("Ошибка подключения к прокси: %s", safe_error)
+        raise ProxyConnectionError(f"Ошибка подключения к прокси: {safe_error}") from e
     except requests.Timeout as e:
-        logger.error("Тайм-аут запроса к KAD (%s с): %s", timeout, e)
+        safe_error = redact_proxy_error(e, proxy_url)
+        if proxy_url:
+            logger.error("Тайм-аут запроса через прокси (%s с): %s", timeout, safe_error)
+            raise ProxyConnectionError(
+                f"Тайм-аут запроса через прокси ({timeout} с): {safe_error}"
+            ) from e
+        logger.error("Тайм-аут запроса к KAD (%s с): %s", timeout, safe_error)
+        raise
+    except requests.ConnectionError as e:
+        safe_error = redact_proxy_error(e, proxy_url)
+        if proxy_url:
+            logger.error("Ошибка соединения через прокси: %s", safe_error)
+            raise ProxyConnectionError(f"Ошибка соединения через прокси: {safe_error}") from e
+        logger.error("Сетевая ошибка при запросе к KAD: %s", safe_error)
         raise
     except requests.RequestException as e:
-        logger.error("Сетевая ошибка при запросе к KAD: %s", e)
+        safe_error = redact_proxy_error(e, proxy_url)
+        logger.error("Сетевая ошибка при запросе к KAD: %s", safe_error)
         raise
 
     logger.info(f"Cases response ok: status={resp.status_code} bytes={len(resp.text)}")
@@ -188,7 +225,8 @@ def build_cases_request(page: int, count: int, courts: list[str] | None = None,
         'Host': 'kad.arbitr.ru',
     }
 
-    proxies = None
+    proxy_settings = parse_proxy_url(PROXY_URL)
+    proxies = proxy_settings.as_requests() if proxy_settings else None
 
     payload = {
         "Page": page,
