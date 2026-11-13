@@ -39,6 +39,30 @@ Playwright синхронный и не умеет прерывать собст
 `BOT_TOKEN`, `ALLOWED_USER_IDS`, `CHECK_INTERVAL_DAYS` — базовая конфигурация.
 Тайм-ауты из таблицы выше можно переопределить одноимёнными переменными окружения.
 
+### Прокси для kad.arbitr.ru
+
+`PROXY_URL` подключает прокси и к Playwright (обновление кук), и к `requests`
+(поиск дел). Для RuCaptcha residential рекомендуется HTTP-порт `2334`:
+
+```env
+PROXY_URL=http://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2334
+```
+
+`USERNAME` — длинный логин из конфигуратора RuCaptcha
+(`ACCOUNTNAME-zone-cis-region-ru-session-...-sessTime-30`), `PASSWORD` — пароль
+аккаунта. Специальные символы в логине/пароле должны быть URL-encoded
+(`@` → `%40`, `:` → `%3A`).
+
+Для SOCKS5 укажите `socks5://USERNAME:PASSWORD@ru.proxy.rucaptcha.com:2333`
+(или `socks5h://` для удалённого DNS). Зависимость `requests[socks]` уже добавлена
+в `requirements.txt`. Важно: pinned Playwright 1.48/Chromium не поддерживает
+SOCKS5 с авторизацией, поэтому для полной работы бота используйте HTTP `2334`;
+при выборе SOCKS5 обновление кук завершится понятной ошибкой.
+
+Если `PROXY_URL` не задан или некорректен, бот логирует ошибку и пробует прямое
+соединение. Если настроенный прокси не отвечает или отвергает авторизацию,
+ошибка логируется без пароля и пробрасывается наверх — прямого обхода не будет.
+
 ## Запуск
 
 ```bash

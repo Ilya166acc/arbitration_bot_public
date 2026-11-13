@@ -215,6 +215,9 @@ class ReliabilityTests(unittest.TestCase):
             START_URL='https://kad.arbitr.ru/',
             USER_AGENT='UA',
             platform=platform,
+            PROXY_URL=None,
+            parse_proxy_url=lambda proxy_url: None,
+            redact_proxy_error=lambda error, proxy_url: str(error),
         )
 
         began = time.monotonic()
@@ -257,6 +260,9 @@ class ReliabilityTests(unittest.TestCase):
             START_URL='https://kad.arbitr.ru/',
             USER_AGENT='UA',
             platform=platform,
+            PROXY_URL=None,
+            parse_proxy_url=lambda proxy_url: None,
+            redact_proxy_error=lambda error, proxy_url: str(error),
         )
         with self.assertRaises(CookieRefreshError):
             ns['refresh_cookies'](10)
