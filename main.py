@@ -6,6 +6,8 @@ import subprocess
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.types import ErrorEvent
 
 from config import BOT_TOKEN, LOG_LEVEL
 from bot.handlers import router
@@ -36,6 +38,22 @@ def ensure_playwright_browser():
         logger.warning(f"⚠️ Ошибка проверки Playwright: {e}")
 
 
+async def on_error(event: ErrorEvent) -> bool:
+    """Глобальный обработчик ошибок aiogram.
+
+    Сетевые сбои api.telegram.org (SSL reset, тайм-ауты) не должны
+    останавливать polling: логируем и считаем обновление обработанным.
+    Остальные ошибки оставляем стандартной обработке aiogram.
+    """
+    if isinstance(event.exception, TelegramNetworkError):
+        logger.error(
+            "🌐 Сетевая ошибка Telegram, polling продолжается: %s",
+            event.exception,
+        )
+        return True
+    return False
+
+
 async def main():
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN не найден!")
@@ -49,6 +67,7 @@ async def main():
     logger.info("🚀 Запускаю бота...")
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.errors.register(on_error)
     dp.include_router(router)
 
     await dp.start_polling(bot)
