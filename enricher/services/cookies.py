@@ -15,9 +15,9 @@ BROWSER_LAUNCH_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_LAUNCH_TIMEOUT_MS", "30000
 
 # Внутренний бюджет ожиданий (~45 c), чтобы гарантированно уложиться
 # в 60-секундный жёсткий тайм-аут из core/parser.py.
-NAVIGATION_SETTLE_MS = 3000
-ACTION_SETTLE_MS = 500
-CLICK_RESULT_WAIT_MS = 4000
+NAVIGATION_SETTLE_MS = 5000
+ACTION_SETTLE_MS = 1000
+CLICK_RESULT_WAIT_MS = 8000
 VISIBILITY_TIMEOUT_MS = 2000
 
 _cookie_write_lock = Lock()
@@ -80,10 +80,52 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
                 page.mouse.wheel(0, 500)
                 page.wait_for_timeout(ACTION_SETTLE_MS)
 
+                # Принудительно удаляем всплывающие баннеры, попапы и оверлеи.
+                # Site-wide промо-баннер перекрывает кнопку «Найти», из-за чего
+                # клик не проходит, результаты не загружаются и DDoS-Guard
+                # выдаёт неполный набор кук (33 вместо валидного набора).
+                try:
+                    page.evaluate("""
+                        (() => {
+                            const selectors = [
+                                '.b-promo_notification-popup_wrapper',
+                                '.b-promo_notification-popup',
+                                '.b-promo_notification',
+                                '.modal-backdrop',
+                            ];
+                            selectors.forEach(sel => {
+                                document.querySelectorAll(sel).forEach(el => el.remove());
+                            });
+                            document.querySelectorAll('*').forEach(el => {
+                                const cls = el.getAttribute('class') || '';
+                                if (/overlay|popup/i.test(cls)) {
+                                    el.remove();
+                                }
+                            });
+                            document.body.style.overflow = 'auto';
+                        })();
+                    """)
+                    page.wait_for_timeout(ACTION_SETTLE_MS)
+                except Exception:
+                    pass
+
                 find_btn = page.locator('button[type="submit"]', has_text="Найти")
                 if find_btn.first.is_visible(timeout=VISIBILITY_TIMEOUT_MS):
-                    find_btn.first.click()
-                    page.wait_for_timeout(CLICK_RESULT_WAIT_MS)
+                    find_btn.first.click(force=True)  # force=True игнорирует перекрывающие слои
+                    # Не ждём фиксированное время, а дожидаемся реальной отрисовки
+                    # таблицы результатов (или сообщения «ничего не найдено»):
+                    # именно финальный AJAX-ответ заставляет DDoS-Guard выдать
+                    # полный набор валидных кук.
+                    try:
+                        page.wait_for_selector(
+                            'a.num_case, .b-found-nothing', timeout=15000
+                        )
+                    except Exception as e:
+                        logger.warning("Результаты поиска не появились за 15 с: %s", e)
+                        # Даже если селектор не дождались, даём странице
+                        # дополнительное время на завершение запросов.
+                        page.wait_for_timeout(CLICK_RESULT_WAIT_MS)
+                    page.wait_for_timeout(3000)
             except Exception as e:
                 logger.warning("Ошибка при имитации кликов: %s", e)
             # =====================================================
