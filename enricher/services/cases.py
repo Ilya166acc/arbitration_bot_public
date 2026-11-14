@@ -4,9 +4,13 @@ import os
 import sys
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+# Подавляем предупреждения об отключённой проверке SSL при работе через прокси.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # enricher может запускаться и как отдельный CLI из своей папки.
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -80,7 +84,7 @@ def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
     try:
         resp = session.post(
             url, cookies=cookies, headers=headers, json=payload,
-            proxies=proxies, timeout=timeout,
+            proxies=proxies, timeout=timeout, verify=False,
         )
         resp.raise_for_status()
     except requests.HTTPError as e:

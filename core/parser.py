@@ -4,18 +4,21 @@
 
 Ключевое требование к надёжности: ни один вызов здесь не должен висеть
 бесконечно. Playwright (sync API) не умеет прерывать собственные зависшие
-операции, поэтому обновление кук вынесено в отдельный поток и ограничено
-жёстким тайм-аутом.
+операции, поэтому обновление кук вынесено в отдельный дочерний процесс
+(multiprocessing.Process) с жёстким тайм-аутом и принудительным
+terminate()/kill(). Блокировка _refresh_guard всегда освобождается в блоке
+finally основного потока.
 """
-import concurrent.futures
 import logging
+import multiprocessing
+from multiprocessing.connection import wait as wait_connections
 import os
 import platform
 import random
+import signal
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -25,13 +28,15 @@ logger = logging.getLogger(__name__)
 ENRICHER_DIR = os.path.abspath(os.path.join(
     os.path.dirname(__file__), "..", "enricher"
 ))
-sys.path.insert(0, ENRICHER_DIR)
+if ENRICHER_DIR not in sys.path:
+    sys.path.insert(0, ENRICHER_DIR)
 
 COOKIES_FILE = os.path.join(ENRICHER_DIR, "cookies.json")
 
 # Жёсткий лимит на обновление кук: дольше ждать бессмысленно,
 # дальше начинается зависание бота (инцидент: >10 часов ожидания).
 COOKIE_REFRESH_TIMEOUT = float(os.getenv("COOKIE_REFRESH_TIMEOUT", "60"))
+PROCESS_TERMINATE_GRACE_SECONDS = 3.0
 
 from config import PROXY_URL
 from core.proxy import parse_proxy_url, redact_proxy_error
@@ -46,8 +51,9 @@ USER_AGENT = (
 )
 START_URL = "https://kad.arbitr.ru/"
 
-# Гарантирует, что одновременно живёт только одна попытка обновления кук:
-# зависший поток Playwright не должен плодить новые браузеры.
+# Гарантирует, что одновременно живёт только одна попытка обновления кук.
+# Освобождается в блоке finally основного потока после завершения или
+# принудительного убийства дочернего процесса.
 _refresh_guard = threading.Lock()
 
 
@@ -59,28 +65,133 @@ class CookieRefreshTimeout(TimeoutError):
     """Обновление кук не уложилось в отведённое время."""
 
 
-def _refresh_worker(headless: bool, offscreen: bool, proxy: dict | None = None) -> dict:
-    """Тело фонового потока: браузер + сбор кук."""
+def _refresh_worker(
+    conn,
+    headless: bool,
+    offscreen: bool,
+    proxy: dict | None = None,
+) -> None:
+    """Тело дочернего процесса: браузер + сбор кук."""
+    # Создаём отдельную группу процессов (POSIX), чтобы при тайм-ауте можно
+    # было убить не только воркер, но и дочерние процессы Playwright/Chromium.
+    if hasattr(os, "setsid"):
+        try:
+            os.setsid()
+        except OSError:
+            pass
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(
+            level=os.getenv("LOG_LEVEL", "INFO"),
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+
     try:
-        return get_cookies_via_browser(
+        data = get_cookies_via_browser(
             start_url=START_URL,
             proxy=proxy,
             user_agent=USER_AGENT,
             headless=headless,
             offscreen=offscreen,
         )
+        payload = {"ok": True, "data": data}
+    except Exception as exc:
+        # Передаём сериализуемые поля: исключения Playwright могут быть не-picklable.
+        payload = {
+            "ok": False,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "is_timeout": (
+                isinstance(exc, TimeoutError)
+                or "timeout" in type(exc).__name__.lower()
+            ),
+        }
+
+    try:
+        conn.send(payload)
+    except Exception:
+        # Основной процесс уже мог закрыть канал по тайм-ауту.
+        pass
     finally:
-        # Флаг занятости снимает именно поток-исполнитель: если его abandon-ят
-        # по тайм-ауту, новые попытки не будут наслаиваться.
-        _refresh_guard.release()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _terminate_process(proc) -> None:
+    """Гарантированно завершает дочерний процесс (terminate -> kill -> join).
+
+    На POSIX дополнительно завершает всю группу процессов воркера, если его
+    пришлось убивать принудительно, чтобы не оставлять осиротевший Chromium.
+    """
+    if proc is None:
+        return
+
+    try:
+        alive = proc.is_alive()
+    except ValueError:
+        # Процесс уже закрыт (proc.close() вызывался ранее).
+        return
+
+    pid = getattr(proc, "pid", None)
+    pgid = None
+    if alive and pid and hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        try:
+            candidate_pgid = os.getpgid(pid)
+            if candidate_pgid == pid and candidate_pgid != os.getpgid(0):
+                pgid = candidate_pgid
+        except OSError:
+            pgid = None
+
+    if alive:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+        proc.join(timeout=PROCESS_TERMINATE_GRACE_SECONDS)
+
+        if proc.is_alive():
+            if pgid is not None:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            proc.join(timeout=5)
+
+        # Добиваем возможные оставшиеся процессы Chromium в группе воркера.
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
+    elif pid is not None:
+        proc.join(timeout=1)
+
+    if not proc.is_alive():
+        try:
+            proc.close()
+        except (AttributeError, ValueError):
+            pass
 
 
 def refresh_cookies(timeout: float | None = None) -> None:
-    """Обновляет cookies.json через Playwright с жёстким тайм-аутом.
+    """Обновляет cookies.json через Playwright в отдельном процессе с жёстким тайм-аутом.
 
-    Работает в отдельном потоке: `future.result(timeout=...)` не даёт боту
-    провисеть дольше `timeout` секунд. По истечении поднимается
-    CookieRefreshTimeout (наследник TimeoutError).
+    Работает в дочернем daemon-процессе `multiprocessing.Process`: если
+    Playwright зависает дольше `timeout` секунд, процесс принудительно
+    убивается через `proc.terminate()` / `proc.kill()`, а `_refresh_guard`
+    гарантированно освобождается в блоке `finally` основного потока.
     """
     timeout = COOKIE_REFRESH_TIMEOUT if timeout is None else timeout
     proxy_settings = parse_proxy_url(PROXY_URL)
@@ -91,63 +202,120 @@ def refresh_cookies(timeout: float | None = None) -> None:
             "Предыдущая попытка обновления кук всё ещё не завершилась"
         )
 
-    logger.info("🔁 Обновляю куки через Playwright (тайм-аут %.0f с)...", timeout)
-    is_windows = platform.system() == "Windows"
+    proc = None
+    parent_conn = None
+    child_conn = None
 
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cookie-refresh")
     try:
-        future = executor.submit(
-            _refresh_worker,
-            headless=not is_windows,   # На Linux будет True
-            offscreen=is_windows,      # На Windows будет True
-            proxy=proxy,
+        logger.info("🔁 Обновляю куки через Playwright (тайм-аут %.0f с)...", timeout)
+        is_windows = platform.system() == "Windows"
+
+        # Используем 'spawn', чтобы избежать дедлоков fork() в многопоточном
+        # процессе (asyncio + asyncio.to_thread) на Linux и одинаково работать
+        # на Linux и Windows.
+        mp_ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+        proc = mp_ctx.Process(
+            target=_refresh_worker,
+            args=(
+                child_conn,
+                not is_windows,  # На Linux будет True
+                is_windows,      # На Windows будет True
+                proxy,
+            ),
+            name="cookie-refresh",
+            daemon=True,
         )
-    except BaseException:
-        # Задача не встала в очередь — поток флаг не снимет, делаем это сами.
-        _refresh_guard.release()
-        executor.shutdown(wait=False)
-        raise
+        proc.start()
+        # Закрываем пишущий конец канала в родителе, чтобы при аварийном
+        # падении воркера сразу получить EOF на parent_conn.
+        child_conn.close()
+        child_conn = None
 
-    try:
-        data = future.result(timeout=timeout)
-    except (TimeoutError, concurrent.futures.TimeoutError) as exc:
-        if not future.done():
-            # Жёсткий тайм-аут: поток всё ещё работает (зависший браузер).
-            future.cancel()
+        ready = wait_connections([parent_conn, proc.sentinel], timeout=timeout)
+        if not ready:
             logger.critical(
-                "⛔ Playwright не уложился в %.0f с — прерываю обновление кук.",
+                "⛔ Playwright не уложился в %.0f с — принудительно завершаю процесс (pid=%s).",
                 timeout,
+                proc.pid,
             )
+            _terminate_process(proc)
+            proc = None
             raise CookieRefreshTimeout(
                 f"Обновление кук через Playwright не завершилось за {timeout:.0f} с"
-            ) from exc
-        # Поток завершился, но внутри Playwright случился собственный TimeoutError.
-        logger.error("❌ Playwright завершился с тайм-аутом: %s", exc)
-        raise CookieRefreshError(f"Ошибка Playwright при обновлении кук: {exc}") from exc
-    except Exception as exc:
-        if proxy_settings is not None:
-            safe_error = redact_proxy_error(exc, proxy_settings.url)
+            )
+
+        result = None
+        if parent_conn in ready or parent_conn.poll():
+            try:
+                result = parent_conn.recv()
+            except (EOFError, OSError):
+                result = None
+
+        # Даём воркеру корректно завершиться после отправки результата.
+        proc.join(timeout=5)
+
+        if not isinstance(result, dict):
+            exit_code = proc.exitcode
             logger.error(
-                "❌ Прокси %s не сработал при обновлении кук: %s",
-                proxy_settings.server,
+                "❌ Процесс Playwright завершился без результата (код %s).",
+                exit_code,
+            )
+            raise CookieRefreshError(
+                f"Процесс Playwright завершился без результата (код {exit_code})"
+            )
+
+        if not result.get("ok"):
+            raw_error = result.get("error") or "неизвестная ошибка"
+            error_type = result.get("error_type") or "Error"
+            is_timeout = bool(result.get("is_timeout"))
+            safe_error = (
+                redact_proxy_error(raw_error, proxy_settings.url)
+                if proxy_settings is not None
+                else raw_error
+            )
+
+            if is_timeout:
+                logger.error("❌ Playwright завершился с тайм-аутом: %s", safe_error)
+                raise CookieRefreshError(
+                    f"Ошибка Playwright при обновлении кук: {safe_error}"
+                )
+
+            if proxy_settings is not None:
+                logger.error(
+                    "❌ Прокси %s не сработал при обновлении кук: %s",
+                    proxy_settings.server,
+                    safe_error,
+                )
+                raise CookieRefreshError(
+                    f"Прокси {proxy_settings.server} не сработал при обновлении кук: {safe_error}"
+                )
+
+            logger.error(
+                "❌ Не удалось получить куки через Playwright (%s): %s",
+                error_type,
                 safe_error,
             )
             raise CookieRefreshError(
-                f"Прокси {proxy_settings.server} не сработал при обновлении кук: {safe_error}"
-            ) from exc
-        logger.exception("❌ Не удалось получить куки через Playwright")
-        raise
-    else:
+                f"Не удалось получить куки через Playwright ({error_type}): {safe_error}"
+            )
+
+        data = result.get("data")
         cookies = (data or {}).get("cookies") or {}
         if not cookies:
             raise CookieRefreshError("Playwright вернул пустой набор кук")
+
         save_cookies(COOKIES_FILE, data)
         logger.info("✅ Куки обновлены: %d шт.", len(cookies))
     finally:
-        # wait=False: поток с зависшим браузером не должен блокировать
-        # вызывающий код. cancel_futures намеренно не используется —
-        # задача должна выполниться, иначе _refresh_guard останется занятым.
-        executor.shutdown(wait=False)
+        for conn in (child_conn, parent_conn):
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        _terminate_process(proc)
+        _refresh_guard.release()
 
 
 def fetch_cases_by_inn(inn: str, days_back: int = 30, cookies_file: str = COOKIES_FILE,

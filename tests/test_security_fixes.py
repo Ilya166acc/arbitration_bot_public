@@ -1,16 +1,18 @@
 """Offline regression tests; no Telegram, browser or KAD access required."""
 import ast
 import asyncio
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
 import json
 import logging
+import multiprocessing
+from multiprocessing.connection import wait as wait_connections
 import os
 from pathlib import Path
 import platform
 import random
+import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -49,7 +51,7 @@ class SecurityFixTests(unittest.TestCase):
         from unittest.mock import AsyncMock
         add_client = Mock(return_value=True)
         ns = functions('bot/handlers.py', {'cmd_add', 'is_valid_inn', 'html_value'},
-                       Message=object, CommandObject=object, escape=escape,
+                       asyncio=asyncio, Message=object, CommandObject=object, escape=escape,
                        add_client=add_client)
         for args in ('7707083893 0', '7707083893 366', '7707083893 nope'):
             message = SimpleNamespace(from_user=SimpleNamespace(id=1), answer=AsyncMock())
@@ -142,7 +144,7 @@ class ReliabilityTests(unittest.TestCase):
             'enricher/services/cookies.py', {'get_cookies_via_browser'},
             sync_playwright=lambda: PlaywrightContext(),
             logger=logging.getLogger(__name__),
-            PAGE_TIMEOUT_MS=30000,
+            PAGE_TIMEOUT_MS=45000,
             BROWSER_LAUNCH_TIMEOUT_MS=30000,
             NAVIGATION_SETTLE_MS=3000,
             ACTION_SETTLE_MS=500,
@@ -156,9 +158,12 @@ class ReliabilityTests(unittest.TestCase):
         data = ns['get_cookies_via_browser']('https://kad.arbitr.ru/', None, 'UA', headless=True)
 
         self.assertEqual(data['cookies'], {'a': 'b'})
-        page.set_default_timeout.assert_called_once_with(30000)
-        context.set_default_timeout.assert_called_once_with(30000)
-        self.assertEqual(page.goto.call_args.kwargs['timeout'], 30000)
+        self.assertNotIn('timeout', browser.new_context.call_args.kwargs)
+        context.set_default_timeout.assert_called_once_with(45000)
+        context.set_default_navigation_timeout.assert_called_once_with(45000)
+        page.set_default_timeout.assert_called_once_with(45000)
+        page.set_default_navigation_timeout.assert_called_once_with(45000)
+        self.assertEqual(page.goto.call_args.kwargs['timeout'], 45000)
         self.assertEqual(playwright.chromium.launch.call_args.kwargs['timeout'], 30000)
         browser.close.assert_called_once()
         context.close.assert_called_once()
@@ -166,10 +171,13 @@ class ReliabilityTests(unittest.TestCase):
     def test_playwright_timeout_defaults_are_strict(self):
         source = (ROOT / 'enricher/services/cookies.py').read_text()
         self.assertIn('context.set_default_timeout(PAGE_TIMEOUT_MS)', source)
+        self.assertIn('context.set_default_navigation_timeout(PAGE_TIMEOUT_MS)', source)
         self.assertIn('page.set_default_timeout(PAGE_TIMEOUT_MS)', source)
-        self.assertIn('PLAYWRIGHT_PAGE_TIMEOUT_MS", "30000"', source)
+        self.assertIn('page.set_default_navigation_timeout(PAGE_TIMEOUT_MS)', source)
+        self.assertIn('PLAYWRIGHT_PAGE_TIMEOUT_MS", "45000"', source)
         self.assertIn('PLAYWRIGHT_LAUNCH_TIMEOUT_MS", "30000"', source)
-        self.assertIn('page.goto(start_url, wait_until=', source)
+        self.assertIn('page.goto(', source)
+        self.assertIn('timeout=PAGE_TIMEOUT_MS', source)
 
     def test_playwright_browser_closed_on_critical_error(self):
         page, context, browser, playwright = self._browser_stubs()
@@ -181,35 +189,36 @@ class ReliabilityTests(unittest.TestCase):
         browser.close.assert_called_once()
         context.close.assert_called_once()
 
-    # ---------- Обновление кук: жёсткий тайм-аут ----------
+    # ---------- Обновление кук: жёсткий тайм-аут и multiprocessing ----------
 
-    def test_cookie_refresh_hard_timeout(self):
-        release = threading.Event()
-        started = threading.Event()
-
-        def hanging_browser(**kwargs):
-            started.set()
-            release.wait(5)
-            return {'cookies': {'session': 'x'}}
-
+    @staticmethod
+    def _parser_namespace(browser, *, guard=None, saved=None, grace_seconds=0.2):
         class CookieRefreshTimeout(TimeoutError):
             pass
 
         class CookieRefreshError(RuntimeError):
             pass
 
-        saved = Mock()
-        guard = threading.Lock()
+        # В оффлайн-тестах функции загружаются через ast/exec, поэтому для
+        # запуска реального дочернего процесса используем fork-контекст.
+        mp_proxy = SimpleNamespace(
+            get_context=lambda _method: multiprocessing.get_context('fork')
+        )
         ns = functions(
-            'core/parser.py', {'refresh_cookies', '_refresh_worker'},
-            ThreadPoolExecutor=ThreadPoolExecutor,
-            concurrent=concurrent,
-            _refresh_guard=guard,
-            get_cookies_via_browser=hanging_browser,
+            'core/parser.py',
+            {'refresh_cookies', '_refresh_worker', '_terminate_process'},
+            multiprocessing=mp_proxy,
+            wait_connections=wait_connections,
+            os=os,
+            signal=signal,
+            logging=logging,
+            PROCESS_TERMINATE_GRACE_SECONDS=grace_seconds,
+            _refresh_guard=guard if guard is not None else threading.Lock(),
+            get_cookies_via_browser=browser,
             logger=logging.getLogger(__name__),
             CookieRefreshTimeout=CookieRefreshTimeout,
             CookieRefreshError=CookieRefreshError,
-            save_cookies=saved,
+            save_cookies=saved if saved is not None else Mock(),
             COOKIES_FILE='unused',
             COOKIE_REFRESH_TIMEOUT=60,
             START_URL='https://kad.arbitr.ru/',
@@ -219,54 +228,110 @@ class ReliabilityTests(unittest.TestCase):
             parse_proxy_url=lambda proxy_url: None,
             redact_proxy_error=lambda error, proxy_url: str(error),
         )
+        return ns, CookieRefreshTimeout, CookieRefreshError
 
-        began = time.monotonic()
-        with self.assertRaises(TimeoutError) as ctx:
-            ns['refresh_cookies'](0.2)
-        self.assertLess(time.monotonic() - began, 2.0)
-        self.assertIsInstance(ctx.exception, CookieRefreshTimeout)
-        self.assertTrue(started.wait(1))
-        saved.assert_not_called()
+    def test_cookie_refresh_uses_spawn_daemon_process_and_releases_lock_in_finally(self):
+        source = (ROOT / 'core/parser.py').read_text()
+        self.assertIn('multiprocessing.get_context("spawn")', source)
+        self.assertIn('daemon=True', source)
+        self.assertIn('proc.terminate()', source)
+        self.assertIn('proc.kill()', source)
+        self.assertIn('_refresh_guard.release()', source)
+        self.assertNotIn('ThreadPoolExecutor', source)
 
-        # Пока зависший поток жив, новые попытки отклоняются сразу,
-        # а не порождают второй браузер.
-        with self.assertRaises(CookieRefreshTimeout):
+    def test_cookie_refresh_hard_timeout_kills_process_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pid_file = os.path.join(tmpdir, 'grandchild.pid')
+
+            def hanging_browser(**kwargs):
+                # Игнорируем SIGTERM, чтобы проверить принудительный SIGKILL.
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                child = subprocess.Popen(['sleep', '60'])
+                with open(pid_file, 'w', encoding='utf-8') as f:
+                    f.write(str(child.pid))
+                time.sleep(60)
+                return {'cookies': {'session': 'x'}}
+
+            saved = Mock()
+            guard = threading.Lock()
+            ns, CookieRefreshTimeout, _ = self._parser_namespace(
+                hanging_browser, guard=guard, saved=saved, grace_seconds=0.2,
+            )
+
+            began = time.monotonic()
+            with self.assertRaises(TimeoutError) as ctx:
+                ns['refresh_cookies'](0.4)
+            elapsed = time.monotonic() - began
+            self.assertLess(elapsed, 3.0)
+            self.assertIsInstance(ctx.exception, CookieRefreshTimeout)
+            saved.assert_not_called()
+
+            # Главный фикс lock poisoning: после убийства зависшего процесса
+            # _refresh_guard сразу освобождён.
+            self.assertTrue(guard.acquire(blocking=False))
+            guard.release()
+
+            # Дочерний процесс (имитация Chromium) тоже убит.
+            if os.path.exists(pid_file):
+                grandchild_pid = int(Path(pid_file).read_text().strip())
+                time.sleep(0.1)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(grandchild_pid, 0)
+
+            # Следующая попытка обновления не блокируется и проходит успешно.
+            ns['get_cookies_via_browser'] = lambda **kwargs: {'cookies': {'session': 'fresh'}}
             ns['refresh_cookies'](5)
+            saved.assert_called_once_with('unused', {'cookies': {'session': 'fresh'}})
+            self.assertTrue(guard.acquire(blocking=False))
+            guard.release()
 
-        release.set()
-        self.assertTrue(guard.acquire(timeout=5))
+    def test_cookie_refresh_blocks_concurrent_call_while_active(self):
+        guard = threading.Lock()
+        saved = Mock()
+        ns, CookieRefreshTimeout, _ = self._parser_namespace(
+            lambda **kwargs: {'cookies': {'session': 'ok'}},
+            guard=guard,
+            saved=saved,
+        )
+        # Имитируем активную попытку обновления в другом потоке.
+        self.assertTrue(guard.acquire(blocking=False))
+        try:
+            with self.assertRaises(CookieRefreshTimeout) as ctx:
+                ns['refresh_cookies'](5)
+            self.assertIn('Предыдущая попытка обновления кук', str(ctx.exception))
+        finally:
+            guard.release()
+
+    def test_cookie_refresh_handles_worker_crash_without_hanging(self):
+        def crashing_browser(**kwargs):
+            os._exit(137)
+
+        guard = threading.Lock()
+        saved = Mock()
+        ns, _, CookieRefreshError = self._parser_namespace(
+            crashing_browser, guard=guard, saved=saved,
+        )
+        began = time.monotonic()
+        with self.assertRaises(CookieRefreshError):
+            ns['refresh_cookies'](10)
+        self.assertLess(time.monotonic() - began, 3.0)
+        saved.assert_not_called()
+        self.assertTrue(guard.acquire(blocking=False))
         guard.release()
 
     def test_cookie_refresh_rejects_empty_cookies(self):
-        class CookieRefreshTimeout(TimeoutError):
-            pass
-
-        class CookieRefreshError(RuntimeError):
-            pass
-
         saved = Mock()
-        ns = functions(
-            'core/parser.py', {'refresh_cookies', '_refresh_worker'},
-            ThreadPoolExecutor=ThreadPoolExecutor,
-            concurrent=concurrent,
-            _refresh_guard=threading.Lock(),
-            get_cookies_via_browser=lambda **kwargs: {'cookies': {}, 'cookiesRaw': []},
-            logger=logging.getLogger(__name__),
-            CookieRefreshTimeout=CookieRefreshTimeout,
-            CookieRefreshError=CookieRefreshError,
-            save_cookies=saved,
-            COOKIES_FILE='unused',
-            COOKIE_REFRESH_TIMEOUT=60,
-            START_URL='https://kad.arbitr.ru/',
-            USER_AGENT='UA',
-            platform=platform,
-            PROXY_URL=None,
-            parse_proxy_url=lambda proxy_url: None,
-            redact_proxy_error=lambda error, proxy_url: str(error),
+        guard = threading.Lock()
+        ns, _, CookieRefreshError = self._parser_namespace(
+            lambda **kwargs: {'cookies': {}, 'cookiesRaw': []},
+            guard=guard,
+            saved=saved,
         )
         with self.assertRaises(CookieRefreshError):
             ns['refresh_cookies'](10)
         saved.assert_not_called()
+        self.assertTrue(guard.acquire(blocking=False))
+        guard.release()
 
     # ---------- Пагинация ----------
 
@@ -408,6 +473,10 @@ class ReliabilityTests(unittest.TestCase):
         ]
         self.assertTrue(posts, 'fetch_cases_html должен отправлять запрос через сессию')
         self.assertTrue(any(kw.arg == 'timeout' for kw in posts[0].keywords))
+        verify_kw = next((kw for kw in posts[0].keywords if kw.arg == 'verify'), None)
+        self.assertIsNotNone(verify_kw, 'fetch_cases_html должен явно передавать verify=False')
+        self.assertIs(ast.literal_eval(verify_kw.value), False)
+        self.assertIn('urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)', source)
         self.assertIn('Retry(', source)
         self.assertIn('status_forcelist=RETRY_STATUSES', source)
         self.assertIn('allowed_methods=frozenset({"GET", "POST", "HEAD"})', source)
