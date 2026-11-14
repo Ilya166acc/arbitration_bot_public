@@ -1,10 +1,12 @@
 """Offline tests for PROXY_URL parsing and wiring; no network access required."""
 import ast
-import concurrent.futures
 import importlib.util
 import logging
+import multiprocessing
+from multiprocessing.connection import wait as wait_connections
 import os
 from pathlib import Path
+import signal
 import sys
 import threading
 from types import SimpleNamespace
@@ -109,12 +111,13 @@ class CasesProxyWiringTests(unittest.TestCase):
         self.session.post.return_value = self.response
         self.logger = logging.getLogger("cases.proxy.test")
 
-    def namespace(self, proxy_url):
+    def namespace(self, proxy_url, ssl_verify=False):
         return functions(
             "enricher/services/cases.py", {"build_cases_request", "fetch_cases_html"},
             logger=self.logger, PROXY_URL=proxy_url, parse_proxy_url=parse_proxy_url,
             redact_proxy_error=redact_proxy_error, session=self.session,
-            DEFAULT_TIMEOUT=(10, 45), ProxyConnectionError=self.ProxyConnectionError,
+            DEFAULT_TIMEOUT=(10, 45), SSL_VERIFY=ssl_verify,
+            ProxyConnectionError=self.ProxyConnectionError,
             CookieExpiredError=self.CookieExpiredError, requests=self.requests,
         )
 
@@ -132,6 +135,14 @@ class CasesProxyWiringTests(unittest.TestCase):
         self.assertEqual(html, "ok")
         self.assertIs(self.session.post.call_args.kwargs["proxies"], proxies)
         self.assertEqual(self.session.post.call_args.kwargs["timeout"], (10, 45))
+        self.assertIs(self.session.post.call_args.kwargs["verify"], False)
+
+    def test_fetch_supports_custom_ca_bundle_path(self):
+        ca_path = "/app/certs/ca-bundle.pem"
+        ns = self.namespace(HTTP_PROXY, ssl_verify=ca_path)
+        proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
+        ns["fetch_cases_html"]("https://kad.arbitr.ru/Kad/SearchInstances", {}, {}, {"Page": 1}, proxies)
+        self.assertEqual(self.session.post.call_args.kwargs["verify"], ca_path)
 
     def test_proxy_failures_are_raised_and_redacted(self):
         ns = self.namespace(HTTP_PROXY)
@@ -171,13 +182,22 @@ class ParserProxyWiringTests(unittest.TestCase):
             pass
 
         self.CookieRefreshError = CookieRefreshError
+        self.saved = Mock()
+        mp_proxy = SimpleNamespace(
+            get_context=lambda _method: multiprocessing.get_context("fork")
+        )
         return functions(
-            "core/parser.py", {"refresh_cookies", "_refresh_worker"},
-            ThreadPoolExecutor=concurrent.futures.ThreadPoolExecutor,
-            concurrent=concurrent, _refresh_guard=threading.Lock(),
+            "core/parser.py", {"refresh_cookies", "_refresh_worker", "_terminate_process"},
+            multiprocessing=mp_proxy,
+            wait_connections=wait_connections,
+            os=os,
+            signal=signal,
+            logging=logging,
+            PROCESS_TERMINATE_GRACE_SECONDS=0.5,
+            _refresh_guard=threading.Lock(),
             get_cookies_via_browser=browser, logger=logging.getLogger("parser.proxy.test"),
             CookieRefreshTimeout=CookieRefreshTimeout, CookieRefreshError=CookieRefreshError,
-            save_cookies=Mock(), COOKIES_FILE="unused", COOKIE_REFRESH_TIMEOUT=60,
+            save_cookies=self.saved, COOKIES_FILE="unused", COOKIE_REFRESH_TIMEOUT=60,
             START_URL="https://kad.arbitr.ru/", USER_AGENT="UA",
             platform=SimpleNamespace(system=lambda: "Linux"),
             PROXY_URL=proxy_url, parse_proxy_url=parse_proxy_url,
@@ -185,24 +205,31 @@ class ParserProxyWiringTests(unittest.TestCase):
         )
 
     def test_refresh_passes_proxy_to_playwright(self):
-        browser = Mock(return_value={"cookies": {"session": "x"}})
+        def browser(**kwargs):
+            return {"cookies": {"session": "x"}, "seen_proxy": kwargs["proxy"]}
+
         ns = self.namespace(HTTP_PROXY, browser)
         ns["refresh_cookies"](5)
-        self.assertEqual(browser.call_args.kwargs["proxy"], {
+        self.assertEqual(self.saved.call_args.args[1]["seen_proxy"], {
             "server": "http://ru.proxy.rucaptcha.com:2334",
             "username": "account-zone-cis-region-ru-session-123-sessTime-30",
             "password": "p@ss:word",
         })
 
     def test_invalid_proxy_falls_back_to_direct_browser(self):
-        browser = Mock(return_value={"cookies": {"session": "x"}})
+        def browser(**kwargs):
+            return {"cookies": {"session": "x"}, "seen_proxy": kwargs["proxy"]}
+
         ns = self.namespace("not-a-proxy-url", browser)
         ns["refresh_cookies"](5)
-        self.assertIsNone(browser.call_args.kwargs["proxy"])
+        self.assertIsNone(self.saved.call_args.args[1]["seen_proxy"])
 
     def test_browser_proxy_failure_is_raised_and_redacted(self):
         settings = parse_proxy_url(HTTP_PROXY)
-        browser = Mock(side_effect=RuntimeError(f"proxy failed {settings.url} {settings.password}"))
+
+        def browser(**kwargs):
+            raise RuntimeError(f"proxy failed {settings.url} {settings.password}")
+
         ns = self.namespace(HTTP_PROXY, browser)
         with self.assertRaises(self.CookieRefreshError) as raised:
             ns["refresh_cookies"](5)

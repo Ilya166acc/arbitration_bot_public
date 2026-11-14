@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # === Жёсткие тайм-ауты Playwright (миллисекунды) ===
 # Без них page.goto()/click()/is_visible() могут ждать ответа бесконечно:
 # именно так проверка зависла более чем на 10 часов.
-PAGE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_PAGE_TIMEOUT_MS", "30000"))
+PAGE_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_PAGE_TIMEOUT_MS", "45000"))
 BROWSER_LAUNCH_TIMEOUT_MS = int(os.getenv("PLAYWRIGHT_LAUNCH_TIMEOUT_MS", "30000"))
 
 # Внутренний бюджет ожиданий (~45 c), чтобы гарантированно уложиться
@@ -55,15 +55,31 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
                 ignore_https_errors=True,
                 viewport={"width": 1366, "height": 768},
             )
+            # browser.new_context() в Playwright не принимает аргумент timeout,
+            # поэтому задаём жёсткий лимит 45 с на контексте и странице.
             context.set_default_timeout(PAGE_TIMEOUT_MS)
+            context.set_default_navigation_timeout(PAGE_TIMEOUT_MS)
             page = context.new_page()
             page.set_default_timeout(PAGE_TIMEOUT_MS)
+            page.set_default_navigation_timeout(PAGE_TIMEOUT_MS)
 
             logger.info("Перехожу на %s", start_url)
             try:
-                page.goto(start_url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT_MS)
+                response = page.goto(
+                    start_url,
+                    wait_until='domcontentloaded',
+                    timeout=PAGE_TIMEOUT_MS,
+                )
+                if proxy and response is not None and getattr(response, "status", None) == 407:
+                    raise RuntimeError("Прокси требует авторизацию (HTTP 407)")
                 page.wait_for_timeout(NAVIGATION_SETTLE_MS)
             except Exception as e:
+                if proxy and (
+                    "407" in str(e)
+                    or "proxy" in str(e).lower()
+                    or "err_tunnel" in str(e).lower()
+                ):
+                    raise
                 logger.warning("Не удалось загрузить страницу: %s", e)
 
             # === УЛЬТИМАТИВНАЯ ОЧИСТКА ОТ БАННЕРОВ (НАШ ФИКС) ===
@@ -110,6 +126,12 @@ def get_cookies_via_browser(start_url: str, proxy: dict | None, user_agent: str,
             return {"cookies": cookie_dict, "cookiesRaw": cookie_list}
 
         except Exception as e:
+            if proxy and (
+                "407" in str(e)
+                or "proxy" in str(e).lower()
+                or "err_tunnel" in str(e).lower()
+            ):
+                raise
             logger.error("Критическая ошибка внутри Playwright: %s", e)
             return {"cookies": {}, "cookiesRaw": []}
         finally:
