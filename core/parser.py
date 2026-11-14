@@ -51,9 +51,10 @@ USER_AGENT = (
 )
 START_URL = "https://kad.arbitr.ru/"
 
-# Гарантирует, что одновременно живёт только одна попытка обновления кук.
-# Освобождается в блоке finally основного потока после завершения или
-# принудительного убийства дочернего процесса.
+# Внутрипроцессная блокировка: защищает от параллельных вызовов refresh_cookies()
+# из разных потоков основного процесса (например, asyncio.to_thread / планировщик).
+# Управляется ТОЛЬКО в родительском процессе (acquire и release в refresh_cookies);
+# дочерний процесс _refresh_worker к _refresh_guard не обращается.
 _refresh_guard = threading.Lock()
 
 
@@ -71,7 +72,11 @@ def _refresh_worker(
     offscreen: bool,
     proxy: dict | None = None,
 ) -> None:
-    """Тело дочернего процесса: браузер + сбор кук."""
+    """Тело дочернего процесса: браузер + сбор кук.
+
+    Не использует _refresh_guard: блокировка живёт и освобождается строго
+    в родительском процессе (в блоке finally функции refresh_cookies).
+    """
     # Создаём отдельную группу процессов (POSIX), чтобы при тайм-ауте можно
     # было убить не только воркер, но и дочерние процессы Playwright/Chromium.
     if hasattr(os, "setsid"):
@@ -197,14 +202,14 @@ def refresh_cookies(timeout: float | None = None) -> None:
     proxy_settings = parse_proxy_url(PROXY_URL)
     proxy = proxy_settings.as_playwright() if proxy_settings else None
 
+    proc = None
+    parent_conn = None
+    child_conn = None
+
     if not _refresh_guard.acquire(blocking=False):
         raise CookieRefreshTimeout(
             "Предыдущая попытка обновления кук всё ещё не завершилась"
         )
-
-    proc = None
-    parent_conn = None
-    child_conn = None
 
     try:
         logger.info("🔁 Обновляю куки через Playwright (тайм-аут %.0f с)...", timeout)
@@ -308,14 +313,16 @@ def refresh_cookies(timeout: float | None = None) -> None:
         save_cookies(COOKIES_FILE, data)
         logger.info("✅ Куки обновлены: %d шт.", len(cookies))
     finally:
-        for conn in (child_conn, parent_conn):
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        _terminate_process(proc)
-        _refresh_guard.release()
+        try:
+            for conn in (child_conn, parent_conn):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            _terminate_process(proc)
+        finally:
+            _refresh_guard.release()
 
 
 def fetch_cases_by_inn(inn: str, days_back: int = 30, cookies_file: str = COOKIES_FILE,

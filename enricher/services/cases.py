@@ -9,8 +9,17 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Подавляем предупреждения об отключённой проверке SSL при работе через прокси.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Проверка SSL при запросах к kad.arbitr.ru через прокси:
+# - если задан путь к CA-бандлу (.pem) в KAD_CA_BUNDLE (например,
+#   Russian Trusted Root CA / Минцифры или CA прокси), проверяем SSL по нему;
+# - иначе используем verify=False, чтобы обойти CERTIFICATE_VERIFY_FAILED
+#   при работе через резидентный прокси.
+KAD_CA_BUNDLE = os.getenv("KAD_CA_BUNDLE", "").strip() or None
+SSL_VERIFY: bool | str = KAD_CA_BUNDLE if KAD_CA_BUNDLE else False
+
+if SSL_VERIFY is False:
+    # Подавляем предупреждения об отключённой проверке SSL при verify=False.
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # enricher может запускаться и как отдельный CLI из своей папки.
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -71,7 +80,8 @@ session = build_session()
 
 
 def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
-                     proxies: dict | None, timeout: float | tuple[float, float] | None = None) -> str:
+                     proxies: dict | None, timeout: float | tuple[float, float] | None = None,
+                     verify: bool | str | None = None) -> str:
     """Запрашивает страницу поиска дел.
 
     Всегда с тайм-аутом (по умолчанию CONNECT_TIMEOUT/READ_TIMEOUT) и с
@@ -79,12 +89,13 @@ def fetch_cases_html(url: str, cookies: dict, headers: dict, payload: dict,
     """
     logger.info(f"Requesting cases: url={url} page={payload.get('Page')} count={payload.get('Count')}")
     timeout = timeout or DEFAULT_TIMEOUT
+    ssl_verify = SSL_VERIFY if verify is None else verify
     proxy_url = (proxies or {}).get("https") or (proxies or {}).get("http")
 
     try:
         resp = session.post(
             url, cookies=cookies, headers=headers, json=payload,
-            proxies=proxies, timeout=timeout, verify=False,
+            proxies=proxies, timeout=timeout, verify=ssl_verify,
         )
         resp.raise_for_status()
     except requests.HTTPError as e:

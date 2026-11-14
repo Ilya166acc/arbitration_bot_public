@@ -239,6 +239,52 @@ class ReliabilityTests(unittest.TestCase):
         self.assertIn('_refresh_guard.release()', source)
         self.assertNotIn('ThreadPoolExecutor', source)
 
+    def test_refresh_worker_does_not_touch_refresh_guard(self):
+        # В дочернем процессе (spawn) _refresh_guard не захвачен;
+        # любой вызов release() в _refresh_worker привёл бы к RuntimeError.
+        tree = ast.parse((ROOT / 'core/parser.py').read_text())
+        worker_node = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == '_refresh_worker'
+        )
+        worker_names = {
+            node.id for node in ast.walk(worker_node) if isinstance(node, ast.Name)
+        }
+        self.assertNotIn('_refresh_guard', worker_names)
+
+        # Прямой запуск _refresh_worker с незахваченным _refresh_guard
+        # (имитация дочернего spawn-процесса) не должен падать.
+        guard = threading.Lock()
+        parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+        ns, _, _ = self._parser_namespace(
+            lambda **kwargs: {'cookies': {'sid': 'ok'}},
+            guard=guard,
+        )
+        # Не вызываем os.setsid() и не мутируем root-логгер процесса test runner.
+        ns['os'] = SimpleNamespace(getenv=os.getenv)
+        ns['logging'] = SimpleNamespace(
+            getLogger=lambda *a, **kw: SimpleNamespace(handlers=[object()]),
+            basicConfig=Mock(),
+        )
+        try:
+            ns['_refresh_worker'](child_conn, True, False, None)
+            self.assertEqual(parent_conn.recv(), {'ok': True, 'data': {'cookies': {'sid': 'ok'}}})
+            self.assertFalse(guard.locked())
+        finally:
+            parent_conn.close()
+
+    def test_refresh_guard_released_even_if_terminate_raises(self):
+        guard = threading.Lock()
+        ns, _, _ = self._parser_namespace(
+            lambda **kwargs: {'cookies': {'sid': 'ok'}},
+            guard=guard,
+        )
+        ns['_terminate_process'] = Mock(side_effect=RuntimeError('cleanup boom'))
+        with self.assertRaisesRegex(RuntimeError, 'cleanup boom'):
+            ns['refresh_cookies'](5)
+        self.assertTrue(guard.acquire(blocking=False))
+        guard.release()
+
     def test_cookie_refresh_hard_timeout_kills_process_and_releases_lock(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             pid_file = os.path.join(tmpdir, 'grandchild.pid')
@@ -474,8 +520,9 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(posts, 'fetch_cases_html должен отправлять запрос через сессию')
         self.assertTrue(any(kw.arg == 'timeout' for kw in posts[0].keywords))
         verify_kw = next((kw for kw in posts[0].keywords if kw.arg == 'verify'), None)
-        self.assertIsNotNone(verify_kw, 'fetch_cases_html должен явно передавать verify=False')
-        self.assertIs(ast.literal_eval(verify_kw.value), False)
+        self.assertIsNotNone(verify_kw, 'fetch_cases_html должен явно передавать verify')
+        self.assertIn('KAD_CA_BUNDLE', source)
+        self.assertIn('SSL_VERIFY: bool | str = KAD_CA_BUNDLE if KAD_CA_BUNDLE else False', source)
         self.assertIn('urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)', source)
         self.assertIn('Retry(', source)
         self.assertIn('status_forcelist=RETRY_STATUSES', source)

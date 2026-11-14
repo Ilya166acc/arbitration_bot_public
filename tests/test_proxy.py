@@ -111,12 +111,13 @@ class CasesProxyWiringTests(unittest.TestCase):
         self.session.post.return_value = self.response
         self.logger = logging.getLogger("cases.proxy.test")
 
-    def namespace(self, proxy_url):
+    def namespace(self, proxy_url, ssl_verify=False):
         return functions(
             "enricher/services/cases.py", {"build_cases_request", "fetch_cases_html"},
             logger=self.logger, PROXY_URL=proxy_url, parse_proxy_url=parse_proxy_url,
             redact_proxy_error=redact_proxy_error, session=self.session,
-            DEFAULT_TIMEOUT=(10, 45), ProxyConnectionError=self.ProxyConnectionError,
+            DEFAULT_TIMEOUT=(10, 45), SSL_VERIFY=ssl_verify,
+            ProxyConnectionError=self.ProxyConnectionError,
             CookieExpiredError=self.CookieExpiredError, requests=self.requests,
         )
 
@@ -135,6 +136,13 @@ class CasesProxyWiringTests(unittest.TestCase):
         self.assertIs(self.session.post.call_args.kwargs["proxies"], proxies)
         self.assertEqual(self.session.post.call_args.kwargs["timeout"], (10, 45))
         self.assertIs(self.session.post.call_args.kwargs["verify"], False)
+
+    def test_fetch_supports_custom_ca_bundle_path(self):
+        ca_path = "/app/certs/ca-bundle.pem"
+        ns = self.namespace(HTTP_PROXY, ssl_verify=ca_path)
+        proxies = {"http": HTTP_PROXY, "https": HTTP_PROXY}
+        ns["fetch_cases_html"]("https://kad.arbitr.ru/Kad/SearchInstances", {}, {}, {"Page": 1}, proxies)
+        self.assertEqual(self.session.post.call_args.kwargs["verify"], ca_path)
 
     def test_proxy_failures_are_raised_and_redacted(self):
         ns = self.namespace(HTTP_PROXY)
