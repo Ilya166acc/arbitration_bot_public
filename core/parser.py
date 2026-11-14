@@ -9,6 +9,7 @@
 terminate()/kill(). Блокировка _refresh_guard всегда освобождается в блоке
 finally основного потока.
 """
+import json
 import logging
 import multiprocessing
 from multiprocessing.connection import wait as wait_connections
@@ -341,8 +342,67 @@ def fetch_cases_by_inn(inn: str, days_back: int = 30, cookies_file: str = COOKIE
                 courts=None, sides=[inn],
                 date_from=date_from, date_to=date_to, include_html=True
             )
-            if not rows and "num_case" not in html and "Дела не найдены" not in html:
-                raise CookieExpiredError("Вместо результатов поиска получена пустая страница или проверка DDoS-Guard")
+            if not rows:
+                # ⚠️ Пустой rows может означать три вещи:
+                # 1) дел реально нет (нормально),
+                # 2) DDoS-Guard вернул заглушку (аномалия → надо обновить куки),
+                # 3) пришёл пустой JSON {"rows":[],"totalCount":0} (нормально).
+                # Различаем по ЯВНЫМ маркерам, а не по длине ответа.
+                html_lower = (html or "").lower()
+
+                # Явные маркеры блокировки DDoS-Guard / Cloudflare / антибота.
+                # Они присутствуют даже в самой короткой заглушке.
+                ddos_markers = (
+                    "ddos-guard", "__ddg", "ddos guard", "ddosguard",
+                    "cf-chl", "checking your browser", "just a moment",
+                    "проверка браузера", "доступ ограничен", "captcha",
+                )
+                if any(m in html_lower for m in ddos_markers):
+                    raise CookieExpiredError(
+                        "DDoS-Guard вернул страницу проверки вместо результатов поиска"
+                    )
+
+                # Явные маркеры «дел нет» от самого kad.arbitr.
+                empty_markers = (
+                    "num_case",            # маркер строки дела в HTML
+                    "дела не найдены",
+                    "b-found-nothing",     # класс блока «ничего не найдено»
+                    "не найдено",
+                    "нет результатов",
+                )
+                is_legit_empty = any(m in html_lower for m in empty_markers)
+
+                # Пустой JSON-ответ от API: {"rows":[],"totalCount":0}
+                # Именно это, судя по логу (bytes=241), и приходит от kad.arbitr.
+                if not is_legit_empty and html:
+                    stripped = html.strip()
+                    if stripped.startswith("{") and stripped.endswith("}"):
+                        try:
+                            data = json.loads(stripped)
+                            if isinstance(data, dict):
+                                if data.get("rows") == [] or data.get("totalCount") == 0:
+                                    is_legit_empty = True
+                        except (ValueError, TypeError):
+                            pass
+
+                if is_legit_empty:
+                    logger.info("ℹ️ По ИНН %s дел не найдено (подтверждено маркерами сайта)", inn)
+                elif not html or len((html or "").strip()) < 50:
+                    # Совсем пустой ответ (< 50 байт) — это точно аномалия,
+                    # а не «дел нет». Порог 50 — только для отлова совсем пустого
+                    # тела, а не для «короткого, но валидного» ответа.
+                    raise CookieExpiredError(
+                        "Пустой ответ от сервера — возможно, блокировка DDoS-Guard"
+                    )
+                else:
+                    # Контент есть, но явных маркеров нет — не роняем проверку,
+                    # а логируем для диагностики. Лучше пропустить клиента,
+                    # чем уронить всю проверку.
+                    logger.warning(
+                        "⚠️ По ИНН %s пустой результат без явных маркеров. "
+                        "Первые 200 символов ответа: %r",
+                        inn, (html or "")[:200],
+                    )
             all_cases.extend(rows)
 
             try:
